@@ -79,54 +79,70 @@ def flag_errors(fn):
     def wrapped_fn(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
-        except:  # noqa: E722
+        except Exception:
             _flagged_error[0] = True
             raise
     return wrapped_fn
 
 
 class PythonMatrix:
-    def __init__(self, action, space):
+    def __init__(self, action):
         self._action = action
-        self._space = space
 
     @flag_errors
     def mult(self, A, x, y):
         import petsc4py.PETSc as PETSc
 
-        X = space_new(self._space)
         with x as x_a:
-            function_set_values(X, x_a)
-        y_a = self._action(X)
-        if is_function(y_a):
-            y_a = function_get_values(y_a)
+            y_a = self._action(x_a)
+
         if not np.can_cast(y_a, PETSc.ScalarType):
             raise EigendecompositionException("Invalid dtype")
         if y_a.shape != (y.getLocalSize(),):
             raise EigendecompositionException("Invalid shape")
+
         y.setArray(y_a)
 
 
-def eigendecompose(space, A_action, B_matrix=None, N_eigenvalues=None,
+def wrapped_action(space, action):
+    action_arg = action
+
+    def action(x):
+        x_a = x
+        x = space_new(space)
+        function_set_values(x, x_a)
+
+        y = action_arg(x)
+        if is_function(y):
+            y = function_get_values(y)
+        y = y.conjugate()
+
+        return y
+
+    return action
+
+
+def eigendecompose(space, A_action, *, B_action=None, N_eigenvalues=None,
                    solver_type=None, problem_type=None, which=None,
                    tolerance=1.0e-12, configure=None):
     # First written 2018-03-01
     """
     Matrix-free interface with SLEPc via slepc4py, loosely following
-    the slepc4py 3.6.0 demo demo/ex3.py, for use in the calculation of Hessian
-    eigendecompositions.
+    the slepc4py 3.6.0 demo demo/ex3.py, for use in the calculation of a
+    Hessian eigendecomposition with a real control space.
 
     Arguments:
 
-    space          Eigenspace.
-    A_action       Function handle accepting a function and returning a
-                   function or NumPy array, defining the action of the
-                   left-hand-side matrix, e.g. as returned by
+    space          Eigenvector space.
+    A_action       Callable accepting a function and returning a function or
+                   NumPy array, defining the complex conjugate of the action
+                   of the left-hand-side matrix, e.g. as returned by
                    Hessian.action_fn.
-    B_matrix       (Optional) Right-hand-side matrix in a generalized
-                   eigendecomposition.
+    B_action       (Optional) Callable accepting a function and returning a
+                   function or NumPy array, defining the complex conjugate of
+                   the action of the right-hand-side matrix.
     N_eigenvalues  (Optional) Number of eigenvalues to attempt to find.
-                   Defaults to a full eigendecomposition.
+                   Defaults to a full spectrum.
     solver_type    (Optional) The solver type.
     problem_type   (Optional) The problem type. If not supplied
                    slepc4py.SLEPc.EPS.ProblemType.NHEP or
@@ -150,8 +166,12 @@ def eigendecompose(space, A_action, B_matrix=None, N_eigenvalues=None,
     import petsc4py.PETSc as PETSc
     import slepc4py.SLEPc as SLEPc
 
+    A_action = wrapped_action(space, A_action)
+    if B_action is not None:
+        B_action = wrapped_action(space, B_action)
+
     if problem_type is None:
-        if B_matrix is None:
+        if B_action is None:
             problem_type = SLEPc.EPS.ProblemType.NHEP
         else:
             problem_type = SLEPc.EPS.ProblemType.GNHEP
@@ -166,9 +186,17 @@ def eigendecompose(space, A_action, B_matrix=None, N_eigenvalues=None,
     comm = space_comm(space)  # .Dup()
 
     A_matrix = PETSc.Mat().createPython(((n, N), (n, N)),
-                                        PythonMatrix(A_action, space),
+                                        PythonMatrix(A_action),
                                         comm=comm)
     A_matrix.setUp()
+
+    if B_action is None:
+        B_matrix = None
+    else:
+        B_matrix = PETSc.Mat().createPython(((n, N), (n, N)),
+                                            PythonMatrix(B_action),
+                                            comm=comm)
+        B_matrix.setUp()
 
     esolver = SLEPc.EPS().create(comm=comm)
     if solver_type is not None:

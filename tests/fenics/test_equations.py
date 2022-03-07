@@ -22,7 +22,7 @@ from fenics import *
 from tlm_adjoint.fenics import *
 from tlm_adjoint.fenics.backend_code_generator_interface import function_vector
 
-from test_base import *
+from .test_base import *
 
 import mpi4py.MPI as MPI
 import numpy as np
@@ -30,6 +30,10 @@ import os
 import petsc4py.PETSc as PETSc
 import pytest
 import ufl
+
+pytestmark = pytest.mark.skipif(
+    MPI.COMM_WORLD.size not in [1, 4],
+    reason="tests must be run in serial, or with 4 processes")
 
 
 @pytest.mark.fenics
@@ -621,12 +625,20 @@ def test_Storage(setup_test, test_leaks):
 
         if h is None:
             function_assign(y_s, y)
+
+            if comm.rank == 0:
+                pid = os.getpid()
+            else:
+                pid = None
+            root_pid = comm.bcast(pid, root=0)
+            filename = f"storage_{root_pid:d}.hdf5"
+
             import h5py
             if comm.size > 1:
-                h = h5py.File(os.path.join("checkpoints~", "storage.hdf5"),
+                h = h5py.File(os.path.join("checkpoints~", filename),
                               "w", driver="mpio", comm=comm)
             else:
-                h = h5py.File(os.path.join("checkpoints~", "storage.hdf5"),
+                h = h5py.File(os.path.join("checkpoints~", filename),
                               "w")
         HDF5Storage(y_s, h, function_name(y_s), save=True).solve()
 
@@ -762,8 +774,13 @@ def test_initial_guess(setup_test, test_leaks):
         x = Function(space_1, name="x")
 
         class TestSolver(ProjectionSolver):
-            def __init__(self, y, x, form_compiler_parameters={},
-                         solver_parameters={}):
+            def __init__(self, y, x, form_compiler_parameters=None,
+                         solver_parameters=None):
+                if form_compiler_parameters is None:
+                    form_compiler_parameters = {}
+                if solver_parameters is None:
+                    solver_parameters = {}
+
                 assert is_function(y)
                 super().__init__(
                     inner(y, TestFunction(x.function_space())) * dx, x,
@@ -822,12 +839,12 @@ def test_initial_guess(setup_test, test_leaks):
             adj_x_0 = Function(space_1, name="adj_x_0", static=True)
             solve(
                 inner(trial_1, test_1) * dx
-                == derivative((dot(x, x) ** 2) * dx, x, du=ufl.conj(test_1)),
+                == 4 * dot(ufl.conj(dot(x, x) * x), ufl.conj(test_1)) * dx,
                 adj_x_0, solver_parameters=ls_parameters_cg,
                 annotate=False, tlm=False)
             NullSolver(x).solve()
             J_term = space_new(J.space())
-            DotProductSolver(x, adj_x_0, J_term).solve()
+            InnerProductSolver(x, adj_x_0, J_term).solve()
             J.addto(J_term)
         else:
             adj_x_0 = None
@@ -845,7 +862,10 @@ def test_initial_guess(setup_test, test_leaks):
         return x, adj_x_0, z, J
 
     y = Function(space_2, name="y", static=True)
-    interpolate_expression(y, exp(X[0]) * (1.0 + X[1] * X[1]))
+    if issubclass(function_dtype(y), (complex, np.complexfloating)):
+        interpolate_expression(y, exp(X[0]) * (1.0 + 1.0j + X[1] * X[1]))
+    else:
+        interpolate_expression(y, exp(X[0]) * (1.0 + X[1] * X[1]))
 
     test_adj_ic = True
     start_manager()

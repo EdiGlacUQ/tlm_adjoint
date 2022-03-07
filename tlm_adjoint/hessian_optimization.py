@@ -39,7 +39,7 @@ __all__ = \
 
 
 class HessianOptimization:
-    def __init__(self, manager=None, cache_adjoint=True):
+    def __init__(self, *, manager=None, cache_adjoint=True):
         if manager is None:
             manager = _manager()
         if manager._cp_method != "memory" \
@@ -94,7 +94,7 @@ class HessianOptimization:
         return manager._tangent_linear(eq, M, dM)
 
     def _add_tangent_linear_equation(self, manager, n, i, eq, M, dM, tlm_eq,
-                                     solve=True):
+                                     *, solve=True):
         for tlm_dep in tlm_eq.initial_condition_dependencies():
             manager._cp.add_initial_condition(tlm_dep)
 
@@ -127,7 +127,7 @@ class HessianOptimization:
             self._adj_cache.register(
                 0, len(manager._blocks), len(manager._block) - 1)
 
-    def _setup_manager(self, M, dM, M0=None, solve_tlm=True):
+    def _setup_manager(self, M, dM, M0=None, *, solve_tlm=True):
         M = tuple(M)
         dM = tuple(dM)
         # M0 ignored
@@ -147,8 +147,8 @@ class HessianOptimization:
         return manager, M, dM
 
 
-class CachedHessian(HessianOptimization, Hessian):
-    def __init__(self, J, manager=None, cache_adjoint=True):
+class CachedHessian(Hessian, HessianOptimization):
+    def __init__(self, J, *, manager=None, cache_adjoint=True):
         """
         A Hessian class for the case where memory checkpointing is used,
         without automatic dropping of references to function objects.
@@ -215,18 +215,20 @@ class SingleBlockHessian(CachedHessian):
         super().__init__(*args, **kwargs)
 
 
-class CachedGaussNewton(HessianOptimization, GaussNewton):
-    def __init__(self, X, R_inv_action, B_inv_action=None, manager=None):
+class CachedGaussNewton(GaussNewton, HessianOptimization):
+    def __init__(self, X, J_space, R_inv_action, B_inv_action=None,
+                 *, manager=None):
         if not isinstance(X, Sequence):
             X = (X,)
 
         HessianOptimization.__init__(self, manager=manager,
                                      cache_adjoint=False)
-        GaussNewton.__init__(self, R_inv_action, B_inv_action=B_inv_action)
+        GaussNewton.__init__(
+            self, J_space, R_inv_action, B_inv_action=B_inv_action)
         self._X = tuple(X)
         self._X_state = tuple(function_state(x) for x in X)
 
-    def _setup_manager(self, M, dM, M0=None):
+    def _setup_manager(self, M, dM, M0=None, *, solve_tlm=True):
         # Possible optimization: We annotate all the TLM equations, but are
         # later only going to differentiate back through the forward
         manager, M, dM = HessianOptimization._setup_manager(

@@ -75,7 +75,6 @@ __all__ = \
 
         "function_is_scalar",
         "function_scalar_value",
-        "new_scalar_function",
 
         "subtract_adjoint_derivative_action",
         "finalize_adjoint_derivative_action",
@@ -84,9 +83,7 @@ __all__ = \
         "time_system_eq",
 
         "function_max_value",
-        "function_tangent_linear",
         "is_real_function",
-        "new_real_function",
         "real_function_value"
     ]
 
@@ -108,7 +105,7 @@ def weakref_method(fn, obj):
     return wrapped_fn
 
 
-class protecteddict(Mapping):
+class protecteddict(Mapping):  # noqa: N801
     def __init__(self, *args, **kwargs):
         """
         A mapping where previous key: value pairs are partially protected from
@@ -140,7 +137,10 @@ class protecteddict(Mapping):
         self._d[key] = value
 
 
-def add_interface(obj, interface_cls, attrs={}):
+def add_interface(obj, interface_cls, attrs=None):
+    if attrs is None:
+        attrs = {}
+
     interface_name = f"{interface_cls.prefix:s}"
     assert not hasattr(obj, interface_name)
     setattr(obj, interface_name, interface_cls)
@@ -172,7 +172,7 @@ class SpaceInterface:
     def _id(self):
         raise InterfaceException("Method not overridden")
 
-    def _new(self, name=None, static=False, cache=None, checkpoint=None):
+    def _new(self, *, name=None, static=False, cache=None, checkpoint=None):
         raise InterfaceException("Method not overridden")
 
 
@@ -201,7 +201,7 @@ def space_id(space):
     return space._tlm_adjoint__space_interface_id()
 
 
-def space_new(space, name=None, static=False, cache=None, checkpoint=None):
+def space_new(space, *, name=None, static=False, cache=None, checkpoint=None):
     return space._tlm_adjoint__space_interface_new(
         name=name, static=static, cache=cache, checkpoint=checkpoint)
 
@@ -295,14 +295,14 @@ class FunctionInterface:
     def _set_values(self, values):
         raise InterfaceException("Method not overridden")
 
-    def _new(self, name=None, static=False, cache=None, checkpoint=None):
+    def _new(self, *, name=None, static=False, cache=None, checkpoint=None):
         return space_new(function_space(self), name=name, static=static,
                          cache=cache, checkpoint=checkpoint)
 
-    def _copy(self, name=None, static=False, cache=None, checkpoint=None):
+    def _copy(self, *, name=None, static=False, cache=None, checkpoint=None):
         raise InterfaceException("Method not overridden")
 
-    def _new_tangent_linear(self, name=None):
+    def _new_tangent_linear(self, *, name=None):
         if function_is_static(self):
             return None
         else:
@@ -445,24 +445,17 @@ def function_set_values(x, values):
     x._tlm_adjoint__function_interface_set_values(values)
 
 
-def function_new(x, name=None, static=False, cache=None, checkpoint=None):
+def function_new(x, *, name=None, static=False, cache=None, checkpoint=None):
     return x._tlm_adjoint__function_interface_new(
         name=name, static=static, cache=cache, checkpoint=checkpoint)
 
 
-def function_copy(x, name=None, static=False, cache=None, checkpoint=None):
+def function_copy(x, *, name=None, static=False, cache=None, checkpoint=None):
     return x._tlm_adjoint__function_interface_copy(
         name=name, static=static, cache=cache, checkpoint=checkpoint)
 
 
-def function_tangent_linear(x, name=None):
-    warnings.warn("function_tangent_linear is deprecated -- "
-                  "use function_new_tangent_linear instead",
-                  DeprecationWarning, stacklevel=2)
-    return function_new_tangent_linear(x, name=name)
-
-
-def function_new_tangent_linear(x, name=None):
+def function_new_tangent_linear(x, *, name=None):
     return x._tlm_adjoint__function_interface_new_tangent_linear(name=name)
 
 
@@ -488,22 +481,6 @@ def real_function_value(x):
     return function_scalar_value(x)
 
 
-def add_new_real_function(backend, fn):
-    warnings.warn("add_new_real_function is deprecated -- "
-                  "use add_new_scalar_function instead",
-                  DeprecationWarning, stacklevel=2)
-    add_new_scalar_function(backend, fn)
-
-
-def new_real_function(name=None, comm=None, static=False, cache=None,
-                      checkpoint=None):
-    warnings.warn("new_real_function is deprecated -- "
-                  "use new_scalar_function instead",
-                  DeprecationWarning, stacklevel=2)
-    return new_scalar_function(name=name, comm=comm, static=static,
-                               cache=cache, checkpoint=checkpoint)
-
-
 def function_is_scalar(x):
     return x._tlm_adjoint__function_interface_is_scalar()
 
@@ -512,21 +489,6 @@ def function_scalar_value(x):
     if not function_is_scalar(x):
         raise InterfaceException("Invalid function")
     return x._tlm_adjoint__function_interface_scalar_value()
-
-
-_new_scalar_function = {}
-
-
-def add_new_scalar_function(backend, fn):
-    assert backend not in _new_scalar_function
-    _new_scalar_function[backend] = fn
-
-
-def new_scalar_function(name=None, comm=None, static=False, cache=None,
-                        checkpoint=None):
-    new_scalar_function = tuple(_new_scalar_function.values())[0]
-    return new_scalar_function(name=name, comm=comm, static=static,
-                               cache=cache, checkpoint=checkpoint)
 
 
 _subtract_adjoint_derivative_action = {}

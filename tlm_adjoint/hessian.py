@@ -18,9 +18,9 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with tlm_adjoint.  If not, see <https://www.gnu.org/licenses/>.
 
-from .interface import function_axpy, function_copy, function_dtype, \
-    function_get_values, function_is_cached, function_is_checkpointed, \
-    function_is_static, function_name, function_new, function_set_values
+from .interface import function_axpy, function_copy, function_get_values, \
+    function_is_cached, function_is_checkpointed, function_is_static, \
+    function_name, function_new
 
 from .caches import clear_caches
 from .equations import InnerProductSolver
@@ -28,7 +28,6 @@ from .functional import Functional
 from .manager import manager as _manager, restore_manager, set_manager
 
 from collections.abc import Sequence
-import numpy as np
 
 __all__ = \
     [
@@ -73,7 +72,7 @@ class Hessian:
 
 
 class GeneralHessian(Hessian):
-    def __init__(self, forward, manager=None):
+    def __init__(self, forward, *, manager=None):
         if manager is None:
             manager = _manager().new()
 
@@ -191,7 +190,8 @@ class GeneralHessian(Hessian):
 
 
 class GaussNewton:
-    def __init__(self, R_inv_action, B_inv_action=None):
+    def __init__(self, J_space, R_inv_action, B_inv_action=None):
+        self._J_space = J_space
         self._R_inv_action = R_inv_action
         self._B_inv_action = B_inv_action
 
@@ -205,28 +205,20 @@ class GaussNewton:
                 M0=None if M0 is None else (M0,))
             return ddJ
 
-        def function_copy_conj(x):
-            if issubclass(function_dtype(x), (float, np.floating)):
-                return function_copy(x)
-            else:
-                x_conj = function_new(x)
-                function_set_values(x_conj, function_get_values(x).conjugate())
-                return x_conj
-
         manager, M, dM, X = self._setup_manager(M, dM, M0=M0)
 
         # J dM
         tau_X = tuple(manager.tlm(M, dM, x) for x in X)
         # R^{-1} conj(J dM)
         R_inv_tau_X = self._R_inv_action(
-            *tuple(function_copy_conj(tau_x) for tau_x in tau_X))
+            *tuple(function_copy(tau_x) for tau_x in tau_X))
         if not isinstance(R_inv_tau_X, Sequence):
             R_inv_tau_X = (R_inv_tau_X,)
 
         # This defines the adjoint right-hand-side appropriately to compute a
         # J^* action
         manager.start()
-        J = Functional(name="J")
+        J = Functional(space=self._J_space)
         assert len(X) == len(R_inv_tau_X)
         for x, R_inv_tau_x in zip(X, R_inv_tau_X):
             J_term = function_new(J.fn())
@@ -241,7 +233,7 @@ class GaussNewton:
         # Prior term: B^{-1} conj(dM)
         if self._B_inv_action is not None:
             B_inv_dM = self._B_inv_action(
-                *tuple(function_copy_conj(dm) for dm in dM))
+                *tuple(function_copy(dm) for dm in dM))
             if not isinstance(B_inv_dM, Sequence):
                 B_inv_dM = (B_inv_dM,)
             assert len(ddJ) == len(B_inv_dM)
@@ -259,11 +251,12 @@ class GaussNewton:
 
 
 class GeneralGaussNewton(GaussNewton):
-    def __init__(self, forward, R_inv_action, B_inv_action=None, manager=None):
+    def __init__(self, forward, J_space, R_inv_action, B_inv_action=None,
+                 *, manager=None):
         if manager is None:
             manager = _manager().new()
 
-        super().__init__(R_inv_action, B_inv_action=B_inv_action)
+        super().__init__(J_space, R_inv_action, B_inv_action=B_inv_action)
         self._forward = forward
         self._manager = manager
 

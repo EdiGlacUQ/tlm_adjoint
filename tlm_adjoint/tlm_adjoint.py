@@ -55,7 +55,7 @@ class ManagerException(Exception):
 
 
 try:
-    from mpi4py.MPI import COMM_WORLD as _default_comm
+    from mpi4py.MPI import COMM_WORLD as DEFAULT_COMM
 except ImportError:
     # As for mpi4py 3.0.3 API
     class SerialComm:
@@ -100,7 +100,7 @@ except ImportError:
             sendobj, = sendobj
             return copy.deepcopy(sendobj)
 
-    _default_comm = SerialComm()
+    DEFAULT_COMM = SerialComm()
 
 
 class Control(Alias):
@@ -600,7 +600,7 @@ class AdjointCache:
 class EquationManager:
     _id_counter = [0]
 
-    def __init__(self, comm=None, cp_method="memory", cp_parameters={}):
+    def __init__(self, comm=None, cp_method="memory", cp_parameters=None):
         """
         Manager for tangent-linear and adjoint models.
 
@@ -667,19 +667,25 @@ class EquationManager:
         # dolfin-adjoint 2017.1.0
 
         if comm is None:
-            comm = _default_comm
+            comm = DEFAULT_COMM
+        if cp_parameters is None:
+            cp_parameters = {}
+
         comm = comm.Dup()
 
         self._comm = comm
         if self._comm.rank == 0:
             id = self._id_counter[0]
             self._id_counter[0] += 1
+            pid = os.getpid()
             comm_py2f = self._comm.py2f()
         else:
-            id = -1
-            comm_py2f = -1
+            id = None
+            pid = None
+            comm_py2f = None
         self._id = self._comm.bcast(id, root=0)
-        self._comm_py2f = self._comm.bcast(comm_py2f, root=0)
+        self._root_pid = self._comm.bcast(pid, root=0)
+        self._root_comm_py2f = self._comm.bcast(comm_py2f, root=0)
 
         self._to_drop_references = []
         self._finalizes = {}
@@ -801,10 +807,13 @@ class EquationManager:
 
         self.configure_checkpointing(cp_method, cp_parameters=cp_parameters)
 
-    def configure_checkpointing(self, cp_method, cp_parameters={}):
+    def configure_checkpointing(self, cp_method, cp_parameters=None):
         """
         Provide a new checkpointing configuration.
         """
+
+        if cp_parameters is None:
+            cp_parameters = {}
 
         if self._annotation_state not in ["initial", "stopped_initial"]:
             raise ManagerException("Cannot configure checkpointing after annotation has started, or after finalization")  # noqa: E501
@@ -1206,10 +1215,11 @@ class EquationManager:
         if cp_format == "pickle":
             cp_filename = os.path.join(
                 cp_path,
-                "checkpoint_%i_%i_%i_%i.pickle" % (self._id,
-                                                   n,
-                                                   self._comm_py2f,
-                                                   self._comm.rank))
+                "checkpoint_%i_%i_%i_%i_%i.pickle" % (self._id,
+                                                      n,
+                                                      self._root_pid,
+                                                      self._root_comm_py2f,
+                                                      self._comm.rank))
             self._cp_disk[n] = cp_filename
             h = open(cp_filename, "wb")
 
@@ -1222,9 +1232,10 @@ class EquationManager:
         elif cp_format == "hdf5":
             cp_filename = os.path.join(
                 cp_path,
-                "checkpoint_%i_%i_%i.hdf5" % (self._id,
-                                              n,
-                                              self._comm_py2f))
+                "checkpoint_%i_%i_%i_%i.hdf5" % (self._id,
+                                                 n,
+                                                 self._root_pid,
+                                                 self._root_comm_py2f))
             self._cp_disk[n] = cp_filename
             import h5py
             if self._comm.size > 1:

@@ -132,8 +132,10 @@ class ExprEquation(Equation):
 
 
 class AssembleSolver(ExprEquation):
-    def __init__(self, rhs, x, form_compiler_parameters={},
+    def __init__(self, rhs, x, form_compiler_parameters=None,
                  match_quadrature=None):
+        if form_compiler_parameters is None:
+            form_compiler_parameters = {}
         if match_quadrature is None:
             match_quadrature = parameters["tlm_adjoint"]["AssembleSolver"]["match_quadrature"]  # noqa: E501
 
@@ -285,12 +287,19 @@ class EquationSolver(ExprEquation):
     # eq, x, bcs, J, form_compiler_parameters and solver_parameters argument
     # usage based on the interface for the solve function in FEniCS (see e.g.
     # FEniCS 2017.1.0)
-    def __init__(self, eq, x, bcs=[], J=None, form_compiler_parameters={},
-                 solver_parameters={}, adjoint_solver_parameters=None,
+    def __init__(self, eq, x, bcs=None, J=None, form_compiler_parameters=None,
+                 solver_parameters=None, adjoint_solver_parameters=None,
                  tlm_solver_parameters=None, initial_guess=None,
                  cache_jacobian=None, cache_adjoint_jacobian=None,
                  cache_tlm_jacobian=None, cache_rhs_assembly=None,
                  match_quadrature=None, defer_adjoint_assembly=None):
+        if bcs is None:
+            bcs = []
+        if form_compiler_parameters is None:
+            form_compiler_parameters = {}
+        if solver_parameters is None:
+            solver_parameters = {}
+
         if isinstance(bcs, backend_DirichletBC):
             bcs = (bcs,)
         else:
@@ -438,10 +447,14 @@ class EquationSolver(ExprEquation):
             self._nl_solve_J = ufl.replace(self._nl_solve_J, replace_map)
 
         if self._forward_b_pa is not None:
-            if self._forward_b_pa[0] is not None:
-                self._forward_b_pa[0][0] = ufl.replace(self._forward_b_pa[0][0], replace_map)  # noqa: E501
-            for dep_index, (mat_form, mat_cache) in self._forward_b_pa[1].items():  # noqa: E501
-                self._forward_b_pa[1][dep_index][0] = ufl.replace(mat_form, replace_map)  # noqa: E501
+            cached_form, mat_forms, non_cached_form = self._forward_b_pa
+
+            if cached_form is not None:
+                cached_form[0] = ufl.replace(cached_form[0], replace_map)
+            for dep_index, (mat_form, mat_cache) in mat_forms.items():
+                mat_forms[dep_index][0] = ufl.replace(mat_form, replace_map)
+
+            # self._forward_b_pa = (cached_form, mat_forms, non_cached_form)
 
         for dep_index, dF in self._adjoint_dF_cache.items():
             if dF is not None:
@@ -470,7 +483,7 @@ class EquationSolver(ExprEquation):
             else:
                 cached_form = [cached_form, CacheRef()]
 
-            self._forward_b_pa = [cached_form, mat_forms, non_cached_form]
+            self._forward_b_pa = (cached_form, mat_forms, non_cached_form)
         else:
             cached_form, mat_forms, non_cached_form = self._forward_b_pa
 
