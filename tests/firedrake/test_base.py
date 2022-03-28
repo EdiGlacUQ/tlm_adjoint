@@ -22,11 +22,14 @@ from firedrake import *
 from tlm_adjoint.firedrake import *
 from tlm_adjoint.firedrake import manager as _manager
 from tlm_adjoint.firedrake.backend import backend_Constant, backend_Function
+from tlm_adjoint.firedrake.backend_code_generator_interface import \
+    interpolate_expression
 
 import copy
 import functools
 import gc
 import hashlib
+import inspect
 import logging
 import mpi4py.MPI as MPI
 import numpy as np
@@ -45,6 +48,7 @@ __all__ = \
         "seed_test",
         "test_configurations",
         "test_leaks",
+        "tmp_path",
 
         "ls_parameters_cg",
         "ns_parameters_newton_cg",
@@ -93,13 +97,19 @@ def setup_test():
 def seed_test(fn):
     @functools.wraps(fn)
     def wrapped_fn(*args, **kwargs):
+        h_kwargs = copy.copy(kwargs)
+        if "tmp_path" in inspect.signature(fn).parameters:
+            # Raises an error if tmp_path is a positional argument
+            del h_kwargs["tmp_path"]
+
         h = hashlib.sha256()
         h.update(fn.__name__.encode("utf-8"))
         h.update(str(args).encode("utf-8"))
-        h.update(str(sorted(kwargs.items(), key=lambda e: e[0])).encode("utf-8"))  # noqa: E501
+        h.update(str(sorted(h_kwargs.items(), key=lambda e: e[0])).encode("utf-8"))  # noqa: E501
         seed = int(h.hexdigest(), 16) + MPI.COMM_WORLD.rank
         seed %= 2 ** 32
         np.random.seed(seed)
+
         return fn(*args, **kwargs)
     return wrapped_fn
 
@@ -185,6 +195,11 @@ def test_leaks():
     assert refs == 0
 
 
+@pytest.fixture
+def tmp_path(tmp_path):
+    return MPI.COMM_WORLD.bcast(tmp_path, root=0)
+
+
 def run_example(example, clear_forward_globals=True):
     start_manager()
     filename = os.path.join(os.path.dirname(__file__),
@@ -195,10 +210,6 @@ def run_example(example, clear_forward_globals=True):
         # Clear objects created by the script. Requires the script to define a
         # 'forward' function.
         gl["forward"].__globals__.clear()
-
-
-def interpolate_expression(F, ex):
-    F.interpolate(ex)
 
 
 ls_parameters_cg = {"ksp_type": "cg",

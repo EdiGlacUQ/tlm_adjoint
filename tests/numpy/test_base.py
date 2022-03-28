@@ -21,9 +21,11 @@
 from tlm_adjoint.numpy import *
 from tlm_adjoint.numpy import manager as _manager
 
+import copy
 import functools
 import gc
 import hashlib
+import inspect
 import logging
 import numpy as np
 import os
@@ -36,6 +38,7 @@ __all__ = \
         "Constant",
         "info",
 
+        "chdir_tmp_path",
         "run_example",
         "seed_test",
         "setup_test",
@@ -58,13 +61,19 @@ def setup_test():
 def seed_test(fn):
     @functools.wraps(fn)
     def wrapped_fn(*args, **kwargs):
+        h_kwargs = copy.copy(kwargs)
+        if "tmp_path" in inspect.signature(fn).parameters:
+            # Raises an error if tmp_path is a positional argument
+            del h_kwargs["tmp_path"]
+
         h = hashlib.sha256()
         h.update(fn.__name__.encode("utf-8"))
         h.update(str(args).encode("utf-8"))
-        h.update(str(sorted(kwargs.items(), key=lambda e: e[0])).encode("utf-8"))  # noqa: E501
+        h.update(str(sorted(h_kwargs.items(), key=lambda e: e[0])).encode("utf-8"))  # noqa: E501
         seed = int(h.hexdigest(), 16)
         seed %= 2 ** 32
         np.random.seed(seed)
+
         return fn(*args, **kwargs)
     return wrapped_fn
 
@@ -120,6 +129,16 @@ def test_leaks():
     assert refs == 0
 
 
+@pytest.fixture
+def chdir_tmp_path(tmp_path):
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+
+    yield
+
+    os.chdir(cwd)
+
+
 def run_example(example, clear_forward_globals=True):
     start_manager()
     filename = os.path.join(os.path.dirname(__file__),
@@ -137,11 +156,11 @@ def info(message):
 
 
 class Constant(Function):
-    def __init__(self, value=0.0, *, name=None, static=False, cache=None,
-                 checkpoint=None):
+    def __init__(self, value=0.0, *, name=None, space_type="primal",
+                 static=False, cache=None, checkpoint=None):
         space = FunctionSpace(1)  # , dtype=default_dtype())
-        super().__init__(space, name=name, static=static, cache=cache,
-                         checkpoint=checkpoint)
+        super().__init__(space, name=name, space_type=space_type,
+                         static=static, cache=cache, checkpoint=checkpoint)
         self.assign(value)
 
     def assign(self, y):
