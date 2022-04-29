@@ -23,7 +23,6 @@ from firedrake import Constant, DirichletBC, Function, FunctionSpace, \
     NonlinearVariationalSolver, Parameters, Projector, Tensor, TestFunction, \
     TrialFunction, UnitIntervalMesh, Vector, adjoint, assemble, homogenize, \
     info, parameters, project, solve
-from firedrake.assemble import _FORM_CACHE_KEY
 import firedrake
 
 backend = "Firedrake"
@@ -31,6 +30,7 @@ backend = "Firedrake"
 backend_ScalarType = firedrake.utils.ScalarType.type
 
 extract_args = firedrake.solving._extract_args
+extract_linear_solver_args = firedrake.solving._extract_linear_solver_args
 
 backend_Constant = Constant
 backend_DirichletBC = DirichletBC
@@ -53,6 +53,7 @@ __all__ = \
         "backend_ScalarType",
 
         "extract_args",
+        "extract_linear_solver_args",
 
         "backend_Constant",
         "backend_DirichletBC",
@@ -68,7 +69,6 @@ __all__ = \
         "backend_project",
         "backend_solve",
 
-        "_FORM_CACHE_KEY",
         "FunctionSpace",
         "Parameters",
         "Projector",

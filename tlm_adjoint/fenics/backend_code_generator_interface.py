@@ -251,8 +251,12 @@ def form_form_compiler_parameters(form, form_compiler_parameters):
         = ffc.analysis.analyze_forms((form,), form_compiler_parameters)
     integral_metadata = tuple(integral_data.metadata
                               for integral_data in form_data.integral_data)
-    qr = ffc.analysis._extract_common_quadrature_rule(integral_metadata)
-    qd = ffc.analysis._extract_common_quadrature_degree(integral_metadata)
+    qr = form_compiler_parameters.get("quadrature_rule", "auto")
+    if qr in [None, "auto"]:
+        qr = ffc.analysis._extract_common_quadrature_rule(integral_metadata)
+    qd = form_compiler_parameters.get("quadrature_degree", "auto")
+    if qd in [None, "auto", -1]:
+        qd = ffc.analysis._extract_common_quadrature_degree(integral_metadata)
     return {"quadrature_rule": qr, "quadrature_degree": qd}
 
 
@@ -375,10 +379,10 @@ def verify_assembly(J, rhs, J_mat, b, bcs, form_compiler_parameters,
 
     if J_mat is not None and not np.isposinf(J_tolerance):
         assert (J_mat - J_mat_debug).norm("linf") \
-            <= J_tolerance * J_mat.norm("linf")
+            <= J_tolerance * J_mat_debug.norm("linf")
 
     if b is not None and not np.isposinf(b_tolerance):
-        assert (b - b_debug).norm("linf") <= b_tolerance * b.norm("linf")
+        assert (b - b_debug).norm("linf") <= b_tolerance * b_debug.norm("linf")
 
 
 def interpolate_expression(x, expr):
@@ -386,6 +390,8 @@ def interpolate_expression(x, expr):
     deps = ufl.algorithms.extract_coefficients(expr)
     for dep in deps:
         check_space_type(dep, "primal")
+
+    expr = eliminate_zeros(expr)
 
     class Expr(UserExpression):
         def eval(self, value, x):
@@ -400,7 +406,7 @@ def interpolate_expression(x, expr):
             raise InterfaceException("Scalar Constant required")
         value = x.values()
         Expr().eval(value, ())
-        x.assign(value)
+        x.assign(value, annotate=False, tlm=False)
     elif isinstance(x, backend_Function):
         x.interpolate(Expr())
     else:
@@ -525,8 +531,22 @@ def solve(*args, **kwargs):
     if not isinstance(args[0], ufl.classes.Equation):
         return backend_solve(*args, **kwargs)
 
-    eq, x, bcs, J, tol, M, form_compiler_parameters, solver_parameters \
-        = extract_args(*args, **kwargs)
+    extracted_args = extract_args(*args, **kwargs)
+    if len(extracted_args) == 8:
+        (eq, x, bcs, J,
+         tol, M,
+         form_compiler_parameters,
+         solver_parameters) \
+            = extracted_args
+        preconditioner = None
+    else:
+        (eq, x, bcs, J,
+         tol, M,
+         preconditioner,
+         form_compiler_parameters,
+         solver_parameters) = extracted_args
+    del extracted_args
+
     check_space_type(x, "primal")
     if bcs is None:
         bcs = ()
@@ -537,7 +557,7 @@ def solve(*args, **kwargs):
     if solver_parameters is None:
         solver_parameters = {}
 
-    if tol is not None or M is not None:
+    if tol is not None or M is not None or preconditioner is not None:
         return backend_solve(*args, **kwargs)
 
     lhs, rhs = eq.lhs, eq.rhs

@@ -129,7 +129,7 @@ class ConstantInterface(_FunctionInterface):
         else:
             value = np.zeros(self.ufl_shape, dtype=function_dtype(self))
             value = backend_Constant(value)
-        self.assign(value)  # annotate=False, tlm=False
+        self.assign(value, annotate=False, tlm=False)
 
     def _assign(self, y):
         if isinstance(y, (int, np.integer,
@@ -144,7 +144,7 @@ class ConstantInterface(_FunctionInterface):
         else:
             assert isinstance(y, backend_Constant)
             value = y
-        self.assign(value)  # annotate=False, tlm=False
+        self.assign(value, annotate=False, tlm=False)
 
     def _axpy(self, *args):  # self, alpha, x
         alpha, x = args
@@ -167,7 +167,7 @@ class ConstantInterface(_FunctionInterface):
                 value = self.values() + alpha * x.values()
                 value.shape = self.ufl_shape
                 value = backend_Constant(value)
-        self.assign(value)  # annotate=False, tlm=False
+        self.assign(value, annotate=False, tlm=False)
 
     def _inner(self, y):
         assert isinstance(y, backend_Constant)
@@ -226,10 +226,10 @@ class ConstantInterface(_FunctionInterface):
         values = comm.bcast(values, root=0)
         if len(self.ufl_shape) == 0:
             values.shape = (1,)
-            self.assign(values[0])  # annotate=False, tlm=False
+            self.assign(values[0], annotate=False, tlm=False)
         else:
             values.shape = self.ufl_shape
-            self.assign(backend_Constant(values))  # annotate=False, tlm=False
+            self.assign(backend_Constant(values), annotate=False, tlm=False)
 
     def _replacement(self):
         if not hasattr(self, "_tlm_adjoint__replacement"):
@@ -346,34 +346,46 @@ def extract_coefficients(expr):
 
 
 def eliminate_zeros(expr, *, force_non_empty_form=False):
+    if isinstance(expr, ufl.classes.Form):
+        if force_non_empty_form:
+            if "_tlm_adjoint__simplified_form_non_empty" in expr._cache:
+                return expr._cache["_tlm_adjoint__simplified_form_non_empty"]
+        else:
+            if "_tlm_adjoint__simplified_form" in expr._cache:
+                return expr._cache["_tlm_adjoint__simplified_form"]
+
     replace_map = {}
     for c in extract_coefficients(expr):
         if isinstance(c, Zero):
             replace_map[c] = ufl.classes.Zero(shape=c.ufl_shape)
 
     if len(replace_map) == 0:
-        return expr
+        simplified_expr = expr
     else:
         simplified_expr = ufl.replace(expr, replace_map)
+    if isinstance(expr, ufl.classes.Form):
+        expr._cache["_tlm_adjoint__simplified_form"] = simplified_expr
 
-        if force_non_empty_form \
-                and isinstance(simplified_expr, ufl.classes.Form) \
-                and simplified_expr.empty():
-            # Inefficient, but it is very difficult to generate a non-empty but
-            # zero valued form
-            arguments = expr.arguments()
-            domain = expr.ufl_domains()[0]
-            zero = ZeroConstant(domain=domain)
-            if len(arguments) == 0:
-                simplified_expr = zero * ufl.ds
-            elif len(arguments) == 1:
-                test, = arguments
-                simplified_expr = zero * test * ufl.ds
-            else:
-                test, trial = arguments
-                simplified_expr = zero * ufl.inner(trial, test) * ufl.ds
+    if force_non_empty_form \
+            and isinstance(simplified_expr, ufl.classes.Form) \
+            and simplified_expr.empty():
+        # Inefficient, but it is very difficult to generate a non-empty but
+        # zero valued form
+        arguments = expr.arguments()
+        domain = expr.ufl_domains()[0]
+        zero = ZeroConstant(domain=domain)
+        if len(arguments) == 0:
+            simplified_expr = zero * ufl.ds
+        elif len(arguments) == 1:
+            test, = arguments
+            simplified_expr = zero * ufl.conj(test) * ufl.ds
+        else:
+            test, trial = arguments
+            simplified_expr = zero * ufl.inner(trial, test) * ufl.ds
+    if isinstance(expr, ufl.classes.Form):
+        expr._cache["_tlm_adjoint__simplified_form_non_empty"] = simplified_expr  # noqa: E501
 
-        return simplified_expr
+    return simplified_expr
 
 
 class Function(backend_Function):

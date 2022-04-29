@@ -27,7 +27,7 @@ from ..hessian_optimization import CachedGaussNewton as _CachedGaussNewton
 from ..interface import InterfaceException, SpaceInterface, \
     add_finalize_adjoint_derivative_action, add_functional_term_eq, \
     add_interface, add_subtract_adjoint_derivative_action, \
-    add_time_system_eq, check_space_type, function_copy, function_new, \
+    add_time_system_eq, check_space_types, function_copy, function_new, \
     function_space, function_space_type, new_function_id, new_space_id, \
     space_id, space_new, subtract_adjoint_derivative_action
 from ..interface import FunctionInterface as _FunctionInterface
@@ -40,6 +40,7 @@ from .functions import Caches, Constant, ConstantInterface, \
     ConstantSpaceInterface, Function, ReplacementFunction, Zero, \
     define_function_alias
 
+import functools
 import mpi4py.MPI as MPI
 import numpy as np
 import ufl
@@ -113,6 +114,7 @@ _FunctionSpace_add_interface = [True]
 
 
 def FunctionSpace_add_interface_disabled(fn):
+    @functools.wraps(fn)
     def wrapped_fn(*args, **kwargs):
         add_interface = _FunctionSpace_add_interface[0]
         _FunctionSpace_add_interface[0] = False
@@ -413,11 +415,11 @@ def _subtract_adjoint_derivative_action(x, y):
         alpha, y = y
         alpha = backend_ScalarType(alpha)
         if hasattr(y, "_tlm_adjoint__function"):
-            check_space_type(y._tlm_adjoint__function, "conjugate_dual")
+            check_space_types(x, y._tlm_adjoint__function)
         if isinstance(x, backend_Constant):
             if len(x.ufl_shape) == 0:
-                # annotate=False, tlm=False
-                x.assign(backend_ScalarType(x) - alpha * y.max())
+                x.assign(backend_ScalarType(x) - alpha * y.max(),
+                         annotate=False, tlm=False)
             else:
                 value = x.values()
                 y_fn = backend_Function(r0_space(x))
@@ -425,8 +427,8 @@ def _subtract_adjoint_derivative_action(x, y):
                 for i, y_fn_c in enumerate(y_fn.split(deepcopy=True)):
                     value[i] -= alpha * y_fn_c.vector().max()
                 value.shape = x.ufl_shape
-                # annotate=False, tlm=False
-                x.assign(backend_Constant(value))
+                x.assign(backend_Constant(value),
+                         annotate=False, tlm=False)
         elif isinstance(x, backend_Function):
             if x.vector().local_size() != y.local_size():
                 raise InterfaceException("Invalid function space")
