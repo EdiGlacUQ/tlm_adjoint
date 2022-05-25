@@ -29,7 +29,6 @@ import firedrake
 import mpi4py.MPI as MPI
 import numpy as np
 import os
-import petsc4py.PETSc as PETSc
 import pytest
 import ufl
 
@@ -425,9 +424,7 @@ def test_ExprEvaluationSolver(setup_test, test_leaks):
 
 
 @pytest.mark.firedrake
-@pytest.mark.skipif(issubclass(PETSc.ScalarType,
-                               (complex, np.complexfloating)),
-                    reason="real only")
+@pytest.mark.skipif(complex_mode, reason="real only")
 @seed_test
 def test_LocalProjectionSolver(setup_test, test_leaks):
     mesh = UnitSquareMesh(10, 10)
@@ -536,10 +533,6 @@ def test_AssembleSolver(setup_test, test_leaks):
 def test_Storage(setup_test, test_leaks,
                  tmp_path):
     comm = manager().comm()
-    if comm.rank == 0:
-        if not (tmp_path / "checkpoints~").exists():
-            (tmp_path / "checkpoints~").mkdir()
-    comm.barrier()
 
     mesh = UnitSquareMesh(20, 20)
     X = SpatialCoordinate(mesh)
@@ -570,10 +563,10 @@ def test_Storage(setup_test, test_leaks,
 
             import h5py
             if comm.size > 1:
-                h = h5py.File(str(tmp_path / "checkpoints~" / filename),
+                h = h5py.File(str(tmp_path / filename),
                               "w", driver="mpio", comm=comm)
             else:
-                h = h5py.File(str(tmp_path / "checkpoints~" / filename),
+                h = h5py.File(str(tmp_path / filename),
                               "w")
         HDF5Storage(y_s, h, function_name(y_s), save=True).solve()
 
@@ -628,9 +621,7 @@ def test_Storage(setup_test, test_leaks,
 
 
 @pytest.mark.firedrake
-@pytest.mark.skipif(issubclass(PETSc.ScalarType,
-                               (complex, np.complexfloating)),
-                    reason="real only")
+@pytest.mark.skipif(complex_mode, reason="real only")
 @no_space_type_checking
 @seed_test
 def test_InnerProductSolver(setup_test, test_leaks):

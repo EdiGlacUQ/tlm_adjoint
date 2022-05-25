@@ -23,7 +23,7 @@ from tlm_adjoint.fenics import *
 from tlm_adjoint.fenics import manager as _manager
 from tlm_adjoint.fenics.backend import backend_Constant, backend_Function
 from tlm_adjoint.fenics.backend_code_generator_interface import \
-    interpolate_expression
+    complex_mode, interpolate_expression
 
 import copy
 import functools
@@ -40,6 +40,7 @@ import weakref
 
 __all__ = \
     [
+        "complex_mode",
         "interpolate_expression",
 
         "run_example",
@@ -76,6 +77,10 @@ def setup_test():
     stop_manager()
 
     logging.getLogger("tlm_adjoint").setLevel(logging.DEBUG)
+
+    yield
+
+    reset_manager("memory", {"drop_references": False})
 
 
 def seed_test(fn):
@@ -157,6 +162,24 @@ _Function__init__orig = backend_Function.__init__
 backend_Function.__init__ = _Function__init__
 
 
+def _EquationManager_configure_checkpointing(self, *args, **kwargs):
+    if hasattr(self, "_cp_method") \
+            and hasattr(self, "_cp_parameters") \
+            and hasattr(self, "_cp_manager"):
+        if self._cp_method == "multistage" \
+                and self._cp_manager.max_n() - self._cp_manager.r() == 0 \
+                and "path" in self._cp_parameters:
+            self._comm.barrier()
+            cp_path = self._cp_parameters["path"]
+            assert not os.path.exists(cp_path) or len(os.listdir(cp_path)) == 0
+
+    _EquationManager_configure_checkpointing__orig(self, *args, **kwargs)
+
+
+_EquationManager_configure_checkpointing__orig = EquationManager.configure_checkpointing  # noqa: E501
+EquationManager.configure_checkpointing = _EquationManager_configure_checkpointing  # noqa: E501
+
+
 @pytest.fixture
 def test_leaks():
     function_ids.clear()
@@ -189,6 +212,8 @@ def test_leaks():
 
     function_ids.clear()
     assert refs == 0
+
+    manager.reset("memory", {"drop_references": False})
 
 
 @pytest.fixture

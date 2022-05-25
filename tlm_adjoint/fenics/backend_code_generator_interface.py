@@ -44,6 +44,7 @@ __all__ = \
         "assemble_arguments",
         "assemble_linear_solver",
         "assemble_matrix",
+        "complex_mode",
         "copy_parameters_dict",
         "form_form_compiler_parameters",
         "function_vector",
@@ -91,6 +92,9 @@ if "jacobian_tolerance" not in _parameters["assembly_verification"]:
 if "rhs_tolerance" not in _parameters["assembly_verification"]:
     _parameters["assembly_verification"].add("rhs_tolerance", np.inf)
 del _parameters
+
+
+complex_mode = False
 
 
 def copy_parameters_dict(parameters):
@@ -362,7 +366,8 @@ def parameters_key(parameters):
         sub_parameters = parameters[name]
         if isinstance(sub_parameters, (Parameters, dict)):
             key.append((name, parameters_key(sub_parameters)))
-        elif isinstance(sub_parameters, Sequence):
+        elif isinstance(sub_parameters, Sequence) \
+                and not isinstance(sub_parameters, str):
             key.append((name, tuple(sub_parameters)))
         else:
             key.append((name, sub_parameters))
