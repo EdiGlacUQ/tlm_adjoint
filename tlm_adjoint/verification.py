@@ -21,12 +21,17 @@
 from .interface import function_assign, function_axpy, function_copy, \
     function_dtype, function_inner, function_is_cached, \
     function_is_checkpointed, function_is_static, function_linf_norm, \
-    function_local_size, function_name, function_new, function_set_values
+    function_local_size, function_name, function_new, function_set_values, \
+    garbage_cleanup, is_function, space_comm
 
-from .caches import clear_caches
-from .manager import manager as _manager, restore_manager, set_manager
+from .caches import clear_caches, local_caches
+from .functional import Functional
+from .manager import manager as _manager
+from .manager import configure_tlm, paused_manager, reset_manager, \
+    restore_manager, set_manager, start_manager, stop_manager
 
 from collections.abc import Sequence
+import functools
 import logging
 import numpy as np
 
@@ -38,6 +43,20 @@ __all__ = \
     ]
 
 
+def wrapped_forward(forward):
+    @functools.wraps(forward)
+    def wrapped_forward(*M):
+        J = forward(*M)
+        if is_function(J):
+            J = Functional(_fn=J)
+        garbage_cleanup(space_comm(J.space()))
+        return J
+
+    return wrapped_forward
+
+
+@local_caches
+@restore_manager
 def taylor_test(forward, M, J_val, dJ=None, ddJ=None, seed=1.0e-2, dM=None,
                 M0=None, size=5, manager=None):
     # Aims for similar behaviour to the dolfin-adjoint taylor_test function in
@@ -58,7 +77,7 @@ def taylor_test(forward, M, J_val, dJ=None, ddJ=None, seed=1.0e-2, dM=None,
     Arguments:
 
     forward  A callable which takes as input one or more functions defining the
-             value of the control, and returns the Functional.
+             value of the control, and returns the functional.
     M        A function, or a sequence of functions. The control parameters.
     J_val    The reference functional value.
     dJ       (Optional if ddJ is supplied) A function, or a sequence of
@@ -78,24 +97,25 @@ def taylor_test(forward, M, J_val, dJ=None, ddJ=None, seed=1.0e-2, dM=None,
 
     if not isinstance(M, Sequence):
         if dJ is not None:
-            dJ = [dJ]
+            dJ = (dJ,)
         if dM is not None:
-            dM = [dM]
+            dM = (dM,)
         if M0 is not None:
-            M0 = [M0]
-        return taylor_test(forward, [M], J_val, dJ=dJ, ddJ=ddJ, seed=seed,
+            M0 = (M0,)
+        return taylor_test(forward, (M,), J_val, dJ=dJ, ddJ=ddJ, seed=seed,
                            dM=dM, M0=M0, size=size, manager=manager)
 
     logger = logging.getLogger("tlm_adjoint.verification")
-    if manager is None:
-        manager = _manager()
+    forward = wrapped_forward(forward)
+    if manager is not None:
+        set_manager(manager)
 
     if M0 is None:
-        M0 = [manager.initial_condition(m) for m in M]
-    M1 = [function_new(m, static=function_is_static(m),
-                       cache=function_is_cached(m),
-                       checkpoint=function_is_checkpointed(m))
-          for m in M]
+        M0 = tuple(map(function_copy, M))
+    M1 = tuple(function_new(m, static=function_is_static(m),
+                            cache=function_is_cached(m),
+                            checkpoint=function_is_checkpointed(m))
+               for m in M)
 
     def functions_inner(X, Y):
         inner = 0.0
@@ -114,7 +134,7 @@ def taylor_test(forward, M, J_val, dJ=None, ddJ=None, seed=1.0e-2, dM=None,
     eps = np.array([2 ** -p for p in range(size)], dtype=np.float64)
     eps = seed * eps * max(1.0, functions_linf_norm(M0))
     if dM is None:
-        dM = [function_new(m1, static=True) for m1 in M1]
+        dM = tuple(function_new(m1, static=True) for m1 in M1)
         for dm in dM:
             dm_arr = np.random.random(function_local_size(dm))
             if issubclass(function_dtype(dm),
@@ -132,11 +152,8 @@ def taylor_test(forward, M, J_val, dJ=None, ddJ=None, seed=1.0e-2, dM=None,
             function_assign(m1, m0)
             function_axpy(m1, eps[i], dm)
         clear_caches()
-        annotation_enabled, tlm_enabled = manager.stop()
-        try:
+        with paused_manager():
             J_vals[i] = forward(*M1).value()
-        finally:
-            manager.start(annotation=annotation_enabled, tlm=tlm_enabled)
     if abs(J_vals.imag).max() == 0.0:
         J_vals = J_vals.real
 
@@ -167,28 +184,30 @@ def taylor_test(forward, M, J_val, dJ=None, ddJ=None, seed=1.0e-2, dM=None,
         return orders_2.min()
 
 
+@local_caches
 def taylor_test_tlm(forward, M, tlm_order, seed=1.0e-2, dMs=None, size=5,
                     manager=None):
     if not isinstance(M, Sequence):
         if dMs is not None:
             dMs = tuple((dM,) for dM in dMs)
-        return taylor_test_tlm(forward, [M], tlm_order, seed=seed, dMs=dMs,
+        return taylor_test_tlm(forward, (M,), tlm_order, seed=seed, dMs=dMs,
                                size=size, manager=manager)
 
     logger = logging.getLogger("tlm_adjoint.verification")
+    forward = wrapped_forward(forward)
     if manager is None:
         manager = _manager()
     tlm_manager = manager.new("memory", {})
     tlm_manager.stop()
 
-    M = [function_copy(m, name=function_name(m),
-                       static=function_is_static(m),
-                       cache=function_is_cached(m),
-                       checkpoint=function_is_checkpointed(m)) for m in M]
-    M1 = [function_new(m, static=function_is_static(m),
-                       cache=function_is_cached(m),
-                       checkpoint=function_is_checkpointed(m))
-          for m in M]
+    M = tuple(function_copy(m, name=function_name(m),
+                            static=function_is_static(m),
+                            cache=function_is_cached(m),
+                            checkpoint=function_is_checkpointed(m)) for m in M)
+    M1 = tuple(function_new(m, static=function_is_static(m),
+                            cache=function_is_cached(m),
+                            checkpoint=function_is_checkpointed(m))
+               for m in M)
 
     def functions_linf_norm(X):
         norm = 0.0
@@ -214,16 +233,15 @@ def taylor_test_tlm(forward, M, tlm_order, seed=1.0e-2, dMs=None, size=5,
     @restore_manager
     def forward_tlm(dMs, *M):
         set_manager(tlm_manager)
-        tlm_manager.reset()
-        tlm_manager.stop()
+        reset_manager()
+        stop_manager()
         clear_caches()
 
-        for dM in dMs:
-            tlm_manager.add_tlm(M, dM)
-        tlm_manager.start(annotation=False, tlm=True)
+        configure_tlm(*[(M, dM) for dM in dMs])
+        start_manager(annotate=False, tlm=True)
         J = forward(*M)
         for dM in dMs:
-            J = J.tlm(M, dM, manager=tlm_manager)
+            J = J.tlm_functional((M, dM))
 
         return J
 
@@ -237,7 +255,6 @@ def taylor_test_tlm(forward, M, tlm_order, seed=1.0e-2, dMs=None, size=5,
         for m0, m1, dm in zip(M, M1, dMs[-1]):
             function_assign(m1, m0)
             function_axpy(m1, eps[i], dm)
-        clear_caches()
         J_vals[i] = forward_tlm(dMs[:-1], *M1).value()
     if abs(J_vals.imag).max() == 0.0:
         J_vals = J_vals.real
@@ -254,24 +271,26 @@ def taylor_test_tlm(forward, M, tlm_order, seed=1.0e-2, dMs=None, size=5,
     return orders_1.min()
 
 
+@local_caches
 def taylor_test_tlm_adjoint(forward, M, adjoint_order, seed=1.0e-2, dMs=None,
                             size=5, manager=None):
     if not isinstance(M, Sequence):
         if dMs is not None:
             dMs = tuple((dM,) for dM in dMs)
         return taylor_test_tlm_adjoint(
-            forward, [M], adjoint_order, seed=seed, dMs=dMs, size=size,
+            forward, (M,), adjoint_order, seed=seed, dMs=dMs, size=size,
             manager=manager)
 
+    forward = wrapped_forward(forward)
     if manager is None:
         manager = _manager()
     tlm_manager = manager.new()
     tlm_manager.stop()
 
-    M = [function_copy(m, name=function_name(m),
-                       static=function_is_static(m),
-                       cache=function_is_cached(m),
-                       checkpoint=function_is_checkpointed(m)) for m in M]
+    M = tuple(function_copy(m, name=function_name(m),
+                            static=function_is_static(m),
+                            cache=function_is_cached(m),
+                            checkpoint=function_is_checkpointed(m)) for m in M)
 
     if dMs is None:
         dM_test = None
@@ -291,22 +310,22 @@ def taylor_test_tlm_adjoint(forward, M, adjoint_order, seed=1.0e-2, dMs=None,
         dMs = dMs[:-1]
 
     @restore_manager
-    def forward_tlm(*M, annotation=False):
+    def forward_tlm(*M, annotate=False):
         set_manager(tlm_manager)
-        tlm_manager.reset()
-        tlm_manager.stop()
+        reset_manager()
+        stop_manager()
         clear_caches()
 
-        for dM in dMs:
-            tlm_manager.add_tlm(M, dM)
-        tlm_manager.start(annotation=annotation, tlm=True)
+        configure_tlm(*[(M, dM) for dM in dMs],
+                      annotate=annotate)
+        start_manager(annotate=annotate, tlm=True)
         J = forward(*M)
         for dM in dMs:
-            J = J.tlm(M, dM, manager=tlm_manager)
+            J = J.tlm_functional((M, dM))
 
         return J
 
-    J = forward_tlm(*M, annotation=True)
+    J = forward_tlm(*M, annotate=True)
     J_val = J.value()
     dJ = tlm_manager.compute_gradient(J, M)
 

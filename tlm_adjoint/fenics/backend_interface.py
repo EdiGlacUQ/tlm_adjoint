@@ -21,36 +21,30 @@
 from .backend import FunctionSpace, UnitIntervalMesh, as_backend_type, \
     backend, backend_Constant, backend_Function, backend_FunctionSpace, \
     backend_ScalarType, backend_Vector, cpp_PETScVector, info
-from ..functional import Functional as _Functional
-from ..hessian import GeneralGaussNewton as _GaussNewton
-from ..hessian_optimization import CachedGaussNewton as _CachedGaussNewton
-from ..interface import SpaceInterface, \
+from ..interface import DEFAULT_COMM, SpaceInterface, \
     add_finalize_adjoint_derivative_action, add_functional_term_eq, \
     add_interface, add_subtract_adjoint_derivative_action, \
-    add_time_system_eq, check_space_types, function_copy, function_new, \
-    function_space, function_space_type, new_function_id, new_space_id, \
+    add_time_system_eq, check_space_types, comm_dup_cached, function_copy, \
+    function_new, function_space_type, new_function_id, new_space_id, \
     space_id, space_new, subtract_adjoint_derivative_action
 from ..interface import FunctionInterface as _FunctionInterface
 from .backend_code_generator_interface import assemble, is_valid_r0_space, \
     r0_space
 
 from .caches import form_neg
-from .equations import AssembleSolver, EquationSolver
+from .equations import Assembly, EquationSolver
 from .functions import Caches, Constant, ConstantInterface, \
     ConstantSpaceInterface, Function, ReplacementFunction, Zero, \
     define_function_alias
+from ..overloaded_float import SymbolicFloat
 
 import functools
-import mpi4py.MPI as MPI
 import numpy as np
 import ufl
 import warnings
 
 __all__ = \
     [
-        "CachedGaussNewton",
-        "Functional",
-        "GaussNewton",
         "new_scalar_function",
 
         "RealFunctionSpace",
@@ -63,9 +57,11 @@ __all__ = \
 
 
 def _Constant__init__(self, *args, domain=None, space=None,
-                      comm=MPI.COMM_WORLD, **kwargs):
+                      comm=None, **kwargs):
     if domain is not None and hasattr(domain, "ufl_domain"):
         domain = domain.ufl_domain()
+    if comm is None:
+        comm = DEFAULT_COMM
 
     backend_Constant._tlm_adjoint__orig___init__(self, *args, **kwargs)
 
@@ -80,7 +76,7 @@ def _Constant__init__(self, *args, domain=None, space=None,
         if self.values().dtype.type != backend_ScalarType:
             raise ValueError("Invalid dtype")
         add_interface(space, ConstantSpaceInterface,
-                      {"comm": comm, "domain": domain,
+                      {"comm": comm_dup_cached(comm), "domain": domain,
                        "dtype": backend_ScalarType, "id": new_space_id()})
     add_interface(self, ConstantInterface,
                   {"id": new_function_id(), "state": 0,
@@ -96,7 +92,7 @@ backend_Constant.__init__ = _Constant__init__
 
 class FunctionSpaceInterface(SpaceInterface):
     def _comm(self):
-        return self.mesh().mpi_comm()
+        return self._tlm_adjoint__space_interface_attrs["comm"]
 
     def _dtype(self):
         return backend_ScalarType
@@ -129,12 +125,22 @@ def _FunctionSpace__init__(self, *args, **kwargs):
     backend_FunctionSpace._tlm_adjoint__orig___init__(self, *args, **kwargs)
     if _FunctionSpace_add_interface[0]:
         add_interface(self, FunctionSpaceInterface,
-                      {"id": new_space_id()})
+                      {"comm": comm_dup_cached(self.mesh().mpi_comm()),
+                       "id": new_space_id()})
 
 
 assert not hasattr(backend_FunctionSpace, "_tlm_adjoint__orig___init__")
 backend_FunctionSpace._tlm_adjoint__orig___init__ = backend_FunctionSpace.__init__  # noqa: E501
 backend_FunctionSpace.__init__ = _FunctionSpace__init__
+
+
+def check_vector_size(fn):
+    @functools.wraps(fn)
+    def wrapped_fn(self, *args, **kwargs):
+        if self.vector().size() != self.function_space().dofmap().global_dimension():  # noqa: E501
+            raise RuntimeError("Unexpected vector size")
+        return fn(self, *args, **kwargs)
+    return wrapped_fn
 
 
 class FunctionInterface(_FunctionInterface):
@@ -172,10 +178,14 @@ class FunctionInterface(_FunctionInterface):
                 = Caches(self)
         return self._tlm_adjoint__function_interface_attrs["caches"]
 
+    @check_vector_size
     def _zero(self):
         self.vector().zero()
 
+    @check_vector_size
     def _assign(self, y):
+        if isinstance(y, SymbolicFloat):
+            y = y.value()
         if isinstance(y, backend_Function):
             if self.vector().local_size() != y.vector().local_size():
                 raise ValueError("Invalid function space")
@@ -192,13 +202,16 @@ class FunctionInterface(_FunctionInterface):
                             annotate=False, tlm=False)
         elif isinstance(y, Zero):
             self.vector().zero()
-        else:
-            assert isinstance(y, backend_Constant)
+        elif isinstance(y, backend_Constant):
             self.assign(y, annotate=False, tlm=False)
+        else:
+            raise TypeError(f"Unexpected type: {type(y)}")
 
-    def _axpy(self, *args):  # self, alpha, x
-        alpha, x = args
+    @check_vector_size
+    def _axpy(self, alpha, x, /):
         alpha = backend_ScalarType(alpha)
+        if isinstance(x, SymbolicFloat):
+            x = x.value()
         if isinstance(x, backend_Function):
             if self.vector().local_size() != x.vector().local_size():
                 raise ValueError("Invalid function space")
@@ -216,12 +229,14 @@ class FunctionInterface(_FunctionInterface):
             self.vector().axpy(alpha, x_.vector())
         elif isinstance(x, Zero):
             pass
-        else:
-            assert isinstance(x, backend_Constant)
+        elif isinstance(x, backend_Constant):
             x_ = backend_Function(self.function_space())
             x_.assign(x, annotate=False, tlm=False)
             self.vector().axpy(alpha, x_.vector())
+        else:
+            raise TypeError(f"Unexpected type: {type(x)}")
 
+    @check_vector_size
     def _inner(self, y):
         if isinstance(y, backend_Function):
             if self.vector().local_size() != y.vector().local_size():
@@ -229,36 +244,41 @@ class FunctionInterface(_FunctionInterface):
             inner = y.vector().inner(self.vector())
         elif isinstance(y, Zero):
             inner = 0.0
-        else:
-            assert isinstance(y, backend_Constant)
+        elif isinstance(y, backend_Constant):
             y_ = backend_Function(self.function_space())
             y_.assign(y, annotate=False, tlm=False)
             inner = y_.vector().inner(self.vector())
+        else:
+            raise TypeError(f"Unexpected type: {type(y)}")
         return inner
 
-    def _max_value(self):
-        return self.vector().max()
-
+    @check_vector_size
     def _sum(self):
         return self.vector().sum()
 
+    @check_vector_size
     def _linf_norm(self):
         return self.vector().norm("linf")
 
+    @check_vector_size
     def _local_size(self):
         return self.vector().local_size()
 
+    @check_vector_size
     def _global_size(self):
         return self.function_space().dofmap().global_dimension()
 
+    @check_vector_size
     def _local_indices(self):
         return slice(*self.function_space().dofmap().ownership_range())
 
+    @check_vector_size
     def _get_values(self):
         values = self.vector().get_local().view()
         values.setflags(write=False)
         return values
 
+    @check_vector_size
     def _set_values(self, values):
         if not np.can_cast(values, backend_ScalarType):
             raise ValueError("Invalid dtype")
@@ -267,6 +287,7 @@ class FunctionInterface(_FunctionInterface):
         self.vector().set_local(values)
         self.vector().apply("insert")
 
+    @check_vector_size
     def _new(self, *, name=None, static=False, cache=None, checkpoint=None,
              rel_space_type="primal"):
         y = function_copy(self, name=name, static=static, cache=cache,
@@ -276,6 +297,7 @@ class FunctionInterface(_FunctionInterface):
         y._tlm_adjoint__function_interface_attrs.d_setitem("space_type", space_type)  # noqa: E501
         return y
 
+    @check_vector_size
     def _copy(self, *, name=None, static=False, cache=None, checkpoint=None):
         y = self.copy(deepcopy=True)
         if name is not None:
@@ -302,6 +324,7 @@ class FunctionInterface(_FunctionInterface):
         return (is_valid_r0_space(self.function_space())
                 and len(self.ufl_shape) == 0)
 
+    @check_vector_size
     def _scalar_value(self):
         # assert function_is_scalar(self)
         return self.vector().max()
@@ -328,7 +351,7 @@ def _Function__init__(self, *args, **kwargs):
     else:
         id = new_space_id()
     add_interface(space, FunctionSpaceInterface,
-                  {"id": id})
+                  {"comm": comm_dup_cached(space.mesh().mpi_comm()), "id": id})
     self._tlm_adjoint__function_interface_attrs["space"] = space
 
 
@@ -368,36 +391,6 @@ def new_scalar_function(*, name=None, comm=None, static=False, cache=None,
                         checkpoint=None):
     return Constant(0.0, name=name, comm=comm, static=static, cache=cache,
                     checkpoint=checkpoint)
-
-
-class Functional(_Functional):
-    def __init__(self, *, space=None, name=None, _fn=None):
-        if space is None and _fn is None:
-            space = function_space(new_scalar_function())
-
-        super().__init__(space=space, name=name, _fn=_fn)
-
-
-class GaussNewton(_GaussNewton):
-    def __init__(self, forward, R_inv_action, B_inv_action=None,
-                 *, J_space=None, manager=None):
-        if J_space is None:
-            J_space = function_space(new_scalar_function())
-
-        super().__init__(
-            forward, J_space, R_inv_action, B_inv_action=B_inv_action,
-            manager=manager)
-
-
-class CachedGaussNewton(_CachedGaussNewton):
-    def __init__(self, X, R_inv_action, B_inv_action=None,
-                 *, J_space=None, manager=None):
-        if J_space is None:
-            J_space = function_space(new_scalar_function())
-
-        super().__init__(
-            X, J_space, R_inv_action, B_inv_action=B_inv_action,
-            manager=manager)
 
 
 def _subtract_adjoint_derivative_action(x, y):
@@ -459,11 +452,11 @@ add_finalize_adjoint_derivative_action(backend,
                                        _finalize_adjoint_derivative_action)
 
 
-def _functional_term_eq(term, x):
+def _functional_term_eq(x, term):
     if isinstance(term, ufl.classes.Form) \
             and len(term.arguments()) == 0 \
-            and isinstance(x, (backend_Constant, backend_Function)):
-        return AssembleSolver(term, x)
+            and isinstance(x, (SymbolicFloat, backend_Constant, backend_Function)):  # noqa: E501
+        return Assembly(x, term)
     else:
         return NotImplemented
 
@@ -498,15 +491,17 @@ add_time_system_eq(backend, _time_system_eq)
 
 def default_comm():
     warnings.warn("default_comm is deprecated -- "
-                  "use mpi4py.MPI.COMM_WORLD instead",
+                  "use DEFAULT_COMM instead",
                   DeprecationWarning, stacklevel=2)
-    return MPI.COMM_WORLD
+    return DEFAULT_COMM
 
 
-def RealFunctionSpace(comm=MPI.COMM_WORLD):
+def RealFunctionSpace(comm=None):
     warnings.warn("RealFunctionSpace is deprecated -- "
                   "use new_scalar_function instead",
                   DeprecationWarning, stacklevel=2)
+    if comm is None:
+        comm = DEFAULT_COMM
     return FunctionSpace(UnitIntervalMesh(comm, comm.size), "R", 0)
 
 

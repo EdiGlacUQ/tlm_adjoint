@@ -21,37 +21,32 @@
 from .backend import FunctionSpace, UnitIntervalMesh, backend, \
     backend_Constant, backend_Function, backend_FunctionSpace, \
     backend_ScalarType, info
-from ..functional import Functional as _Functional
-from ..hessian import GeneralGaussNewton as _GaussNewton
-from ..hessian_optimization import CachedGaussNewton as _CachedGaussNewton
-from ..interface import SpaceInterface, \
+from ..interface import DEFAULT_COMM, SpaceInterface, \
     add_finalize_adjoint_derivative_action, add_functional_term_eq, \
     add_interface, add_subtract_adjoint_derivative_action, \
-    add_time_system_eq, check_space_types, function_comm, function_dtype, \
-    function_is_scalar, function_scalar_value, function_space, \
-    new_function_id, new_space_id, space_id, space_new, \
-    subtract_adjoint_derivative_action
+    add_time_system_eq, check_space_types, comm_dup_cached, function_comm, \
+    function_dtype, function_is_alias, function_is_scalar, \
+    function_scalar_value, new_function_id, new_space_id, space_id, \
+    space_new, subtract_adjoint_derivative_action
 from ..interface import FunctionInterface as _FunctionInterface
 from .backend_code_generator_interface import assemble, is_valid_r0_space
 
+from ..overloaded_float import SymbolicFloat
+
 from .caches import form_neg
-from .equations import AssembleSolver, EquationSolver
+from .equations import Assembly, EquationSolver
 from .functions import Caches, Constant, ConstantInterface, \
     ConstantSpaceInterface, Function, ReplacementFunction, Zero, \
     define_function_alias
 
-import mpi4py.MPI as MPI
+from functools import cached_property
 import numpy as np
 import petsc4py.PETSc as PETSc
-from pyadjoint.block_variable import BlockVariable
 import ufl
 import warnings
 
 __all__ = \
     [
-        "CachedGaussNewton",
-        "Functional",
-        "GaussNewton",
         "new_scalar_function",
 
         "RealFunctionSpace",
@@ -63,21 +58,13 @@ __all__ = \
     ]
 
 
-def _BlockVariable__init__(self, output):
-    # Prevent a circular reference. See Firedrake issue #1617.
-    BlockVariable._tlm_adjoint__orig___init__(self, None)
-
-
-assert not hasattr(BlockVariable, "_tlm_adjoint__orig___init__")
-BlockVariable._tlm_adjoint__orig___init__ = BlockVariable.__init__
-BlockVariable.__init__ = _BlockVariable__init__
-
-
 # Aim for compatibility with Firedrake API, git master revision
 # efb48f4f178ae4989c146640025641cf0cc00a0e, Apr 19 2021
 def _Constant__init__(self, value, domain=None, *,
-                      name=None, space=None, comm=MPI.COMM_WORLD,
+                      name=None, space=None, comm=None,
                       **kwargs):
+    if comm is None:
+        comm = DEFAULT_COMM
     backend_Constant._tlm_adjoint__orig___init__(self, value, domain=domain,
                                                  **kwargs)
 
@@ -88,7 +75,7 @@ def _Constant__init__(self, value, domain=None, *,
     if space is None:
         space = self.ufl_function_space()
         add_interface(space, ConstantSpaceInterface,
-                      {"comm": comm, "domain": domain,
+                      {"comm": comm_dup_cached(comm), "domain": domain,
                        "dtype": backend_ScalarType, "id": new_space_id()})
     add_interface(self, ConstantInterface,
                   {"id": new_function_id(), "name": name, "state": 0,
@@ -104,7 +91,7 @@ backend_Constant.__init__ = _Constant__init__
 
 class FunctionSpaceInterface(SpaceInterface):
     def _comm(self):
-        return self.comm
+        return self._tlm_adjoint__space_interface_attrs["comm"]
 
     def _dtype(self):
         return backend_ScalarType
@@ -121,7 +108,7 @@ class FunctionSpaceInterface(SpaceInterface):
 def _FunctionSpace__init__(self, *args, **kwargs):
     backend_FunctionSpace._tlm_adjoint__orig___init__(self, *args, **kwargs)
     add_interface(self, FunctionSpaceInterface,
-                  {"id": new_space_id()})
+                  {"comm": comm_dup_cached(self.comm), "id": new_space_id()})
 
 
 assert not hasattr(backend_FunctionSpace, "_tlm_adjoint__orig___init__")
@@ -131,7 +118,7 @@ backend_FunctionSpace.__init__ = _FunctionSpace__init__
 
 class FunctionInterface(_FunctionInterface):
     def _comm(self):
-        return self.comm
+        return self._tlm_adjoint__function_interface_attrs["comm"]
 
     def _space(self):
         return self.function_space()
@@ -175,6 +162,8 @@ class FunctionInterface(_FunctionInterface):
             x_v.zeroEntries()
 
     def _assign(self, y):
+        if isinstance(y, SymbolicFloat):
+            y = y.value()
         if isinstance(y, backend_Function):
             with self.dat.vec as x_v, y.dat.vec_ro as y_v:
                 if x_v.getLocalSize() != y_v.getLocalSize():
@@ -194,21 +183,26 @@ class FunctionInterface(_FunctionInterface):
         elif isinstance(y, Zero):
             with self.dat.vec_wo as x_v:
                 x_v.zeroEntries()
-        else:
-            assert isinstance(y, backend_Constant)
+        elif isinstance(y, backend_Constant):
             self.assign(y, annotate=False, tlm=False)
+        else:
+            raise TypeError(f"Unexpected type: {type(y)}")
 
         e = self.ufl_element()
         if e.family() == "Real" and e.degree() == 0:
             # Work around Firedrake issue #1459
             values = self.dat.data_ro.copy()
-            values = function_comm(self).bcast(values, root=0)
+            comm = function_comm(self)
+            if comm.rank != 0:
+                values = None
+            values = comm.bcast(values, root=0)
             self.dat.data[:] = values
 
-    def _axpy(self, *args):  # self, alpha, x
-        alpha, x = args
+    def _axpy(self, alpha, x, /):
         dtype = function_dtype(self)
         alpha = dtype(alpha)
+        if isinstance(x, SymbolicFloat):
+            x = x.value()
         if isinstance(x, backend_Function):
             with self.dat.vec as y_v, x.dat.vec_ro as x_v:
                 if y_v.getLocalSize() != x_v.getLocalSize():
@@ -221,15 +215,19 @@ class FunctionInterface(_FunctionInterface):
                         annotate=False, tlm=False)
         elif isinstance(x, Zero):
             pass
-        else:
-            assert isinstance(x, backend_Constant)
+        elif isinstance(x, backend_Constant):
             self.assign(self + alpha * x, annotate=False, tlm=False)
+        else:
+            raise TypeError(f"Unexpected type: {type(x)}")
 
         e = self.ufl_element()
         if e.family() == "Real" and e.degree() == 0:
             # Work around Firedrake issue #1459
             values = self.dat.data_ro.copy()
-            values = function_comm(self).bcast(values, root=0)
+            comm = function_comm(self)
+            if comm.rank != 0:
+                values = None
+            values = comm.bcast(values, root=0)
             self.dat.data[:] = values
 
     def _inner(self, y):
@@ -240,18 +238,14 @@ class FunctionInterface(_FunctionInterface):
                 inner = x_v.dot(y_v)
         elif isinstance(y, Zero):
             inner = 0.0
-        else:
-            assert isinstance(y, backend_Constant)
+        elif isinstance(y, backend_Constant):
             y_ = backend_Function(self.function_space())
             y_.assign(y, annotate=False, tlm=False)
             with self.dat.vec_ro as x_v, y_.dat.vec_ro as y_v:
                 inner = x_v.dot(y_v)
+        else:
+            raise TypeError(f"Unexpected type: {type(y)}")
         return inner
-
-    def _max_value(self):
-        with self.dat.vec_ro as x_v:
-            max = x_v.max()[1]
-        return max
 
     def _sum(self):
         with self.dat.vec_ro as x_v:
@@ -282,6 +276,7 @@ class FunctionInterface(_FunctionInterface):
         with self.dat.vec_ro as x_v:
             with x_v as x_v_a:
                 values = x_v_a.copy()
+        values.setflags(write=False)
         return values
 
     def _set_values(self, values):
@@ -317,8 +312,9 @@ class FunctionInterface(_FunctionInterface):
 def _Function__init__(self, *args, **kwargs):
     backend_Function._tlm_adjoint__orig___init__(self, *args, **kwargs)
     add_interface(self, FunctionInterface,
-                  {"id": new_function_id(), "state": 0, "space_type": "primal",
-                   "static": False, "cache": False, "checkpoint": True})
+                  {"comm": comm_dup_cached(self.comm), "id": new_function_id(),
+                   "state": 0, "space_type": "primal", "static": False,
+                   "cache": False, "checkpoint": True})
 
 
 assert not hasattr(backend_Function, "_tlm_adjoint__orig___init__")
@@ -338,24 +334,30 @@ backend_Function.__getattr__ = _Function__getattr__
 
 
 # Aim for compatibility with Firedrake API, git master revision
-# ac22e4c55d6fad32ddc9e936cd3674fb8a75f1da, Mar 16 2022
-def _Function_split(self):
-    Y = backend_Function._tlm_adjoint__orig_split(self)
+# c0b45ce2123fdeadf358df1d5655ce42f3b3d74b, Feb 1 2023
+@cached_property
+def _Function_subfunctions(self):
+    Y = backend_Function._tlm_adjoint__orig_subfunctions.__get__(self,
+                                                                 type(self))
     for i, y in enumerate(Y):
-        define_function_alias(y, self, key=("split", i))
+        define_function_alias(y, self, key=("subfunctions", i))
     return Y
 
 
-assert not hasattr(backend_Function, "_tlm_adjoint__orig_split")
-backend_Function._tlm_adjoint__orig_split = backend_Function.split
-backend_Function.split = _Function_split
+assert not hasattr(backend_Function, "_tlm_adjoint__orig_subfunctions")
+backend_Function._tlm_adjoint__orig_subfunctions = backend_Function.subfunctions  # noqa: E501
+backend_Function.subfunctions = _Function_subfunctions
+backend_Function.subfunctions.__set_name__(
+    backend_Function.subfunctions, "_tlm_adjoint___Function_subfunctions")
 
 
 # Aim for compatibility with Firedrake API, git master revision
-# ac22e4c55d6fad32ddc9e936cd3674fb8a75f1da, Mar 16 2022
+# f322d327db1efb56e8078f4883a2d62fa0f63c45, Oct 26 2022
 def _Function_sub(self, i):
+    self.subfunctions
     y = backend_Function._tlm_adjoint__orig_sub(self, i)
-    define_function_alias(y, self, key=("sub", i))
+    if not function_is_alias(y):
+        define_function_alias(y, self, key=("sub", i))
     return y
 
 
@@ -368,36 +370,6 @@ def new_scalar_function(*, name=None, comm=None, static=False, cache=None,
                         checkpoint=None):
     return Constant(0.0, name=name, comm=comm, static=static, cache=cache,
                     checkpoint=checkpoint)
-
-
-class Functional(_Functional):
-    def __init__(self, *, space=None, name=None, _fn=None):
-        if space is None and _fn is None:
-            space = function_space(new_scalar_function())
-
-        super().__init__(space=space, name=name, _fn=_fn)
-
-
-class GaussNewton(_GaussNewton):
-    def __init__(self, forward, R_inv_action, B_inv_action=None,
-                 *, J_space=None, manager=None):
-        if J_space is None:
-            J_space = function_space(new_scalar_function())
-
-        super().__init__(
-            forward, J_space, R_inv_action, B_inv_action=B_inv_action,
-            manager=manager)
-
-
-class CachedGaussNewton(_CachedGaussNewton):
-    def __init__(self, X, R_inv_action, B_inv_action=None,
-                 *, J_space=None, manager=None):
-        if J_space is None:
-            J_space = function_space(new_scalar_function())
-
-        super().__init__(
-            X, J_space, R_inv_action, B_inv_action=B_inv_action,
-            manager=manager)
 
 
 def _subtract_adjoint_derivative_action(x, y):
@@ -444,11 +416,11 @@ add_finalize_adjoint_derivative_action(backend,
                                        _finalize_adjoint_derivative_action)
 
 
-def _functional_term_eq(term, x):
+def _functional_term_eq(x, term):
     if isinstance(term, ufl.classes.Form) \
             and len(term.arguments()) == 0 \
-            and isinstance(x, (backend_Constant, backend_Function)):
-        return AssembleSolver(term, x)
+            and isinstance(x, (SymbolicFloat, backend_Constant, backend_Function)):  # noqa: E501
+        return Assembly(x, term)
     else:
         return NotImplemented
 
@@ -483,9 +455,9 @@ add_time_system_eq(backend, _time_system_eq)
 
 def default_comm():
     warnings.warn("default_comm is deprecated -- "
-                  "use mpi4py.MPI.COMM_WORLD instead",
+                  "use DEFAULT_COMM instead",
                   DeprecationWarning, stacklevel=2)
-    return MPI.COMM_WORLD
+    return DEFAULT_COMM
 
 
 def RealFunctionSpace(comm=None):
@@ -493,7 +465,7 @@ def RealFunctionSpace(comm=None):
                   "use new_scalar_function instead",
                   DeprecationWarning, stacklevel=2)
     if comm is None:
-        comm = MPI.COMM_WORLD
+        comm = DEFAULT_COMM
     return FunctionSpace(UnitIntervalMesh(comm.size, comm=comm), "R", 0)
 
 

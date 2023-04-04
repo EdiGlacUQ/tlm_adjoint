@@ -21,6 +21,7 @@
 from tlm_adjoint.numpy import *
 from tlm_adjoint.numpy import manager as _manager
 from tlm_adjoint.alias import WeakAlias
+from tlm_adjoint.checkpoint_schedules.binomial import optimal_steps
 
 from .test_base import *
 
@@ -38,8 +39,8 @@ except ImportError:
 @pytest.mark.numpy
 @no_space_type_checking
 @seed_test
-def test_EmptySolver(setup_test, test_leaks, test_default_dtypes):
-    class EmptySolver(Equation):
+def test_EmptyEquation(setup_test, test_leaks, test_default_dtypes):
+    class EmptyEquation(Equation):
         def __init__(self):
             super().__init__([], [], nl_deps=[], ic=False, adj_ic=False)
 
@@ -49,13 +50,13 @@ def test_EmptySolver(setup_test, test_leaks, test_default_dtypes):
     space = FunctionSpace(100)
 
     def forward(F):
-        EmptySolver().solve()
+        EmptyEquation().solve()
 
         F_dot_F = Constant(name="F_dot_F")
-        DotProductSolver(F, F, F_dot_F).solve()
+        DotProduct(F_dot_F, F, F).solve()
 
         J = Functional(name="J")
-        DotProductSolver(F_dot_F, F_dot_F, J.fn()).solve()
+        DotProduct(J.function(), F_dot_F, F_dot_F).solve()
         return J
 
     F = Function(space, name="F")
@@ -152,8 +153,8 @@ def test_Referrers_LinearEquation(setup_test, test_leaks):
         x = Constant(0.0, name="x")
 
         M = IdentityMatrix()
-        b = NormSqRHS(m, M=M)
-        linear_eq = LinearEquation([b, b], x, A=M)
+        b = InnerProductRHS(m, m, M=M)
+        linear_eq = LinearEquation(x, [b, b], A=M)
         linear_eq.solve()
 
         if forward_run:
@@ -191,10 +192,10 @@ def test_Referrers_LinearEquation(setup_test, test_leaks):
                 assert not function_is_replacement(dep)
 
         y = Constant(0.0, name="y")
-        LinearEquation(b, y, A=M).solve()
+        LinearEquation(y, b, A=M).solve()
 
         z = Constant(0.0, name="z")
-        AxpySolver(x, 1.0, y, z).solve()
+        Axpy(z, x, 1.0, y).solve()
 
         if forward_run:
             manager.drop_references()
@@ -225,7 +226,7 @@ def test_Referrers_LinearEquation(setup_test, test_leaks):
         M = IdentityMatrix()
 
         J = Functional(name="J")
-        NormSqSolver(z, J.fn(), M=M).solve()
+        InnerProduct(J.function(), z, z, M=M).solve()
         return J
 
     m = Constant(np.sqrt(2.0), name="m")
@@ -267,22 +268,22 @@ def test_Referrers_LinearEquation(setup_test, test_leaks):
 @seed_test
 def test_Referrers_FixedPointEquation(setup_test, test_leaks, test_default_dtypes):  # noqa: E501
     def forward(m, forward_run=False):
-        class NewtonIterationSolver(Equation):
-            def __init__(self, m, x0, x):
+        class NewtonSolver(Equation):
+            def __init__(self, x, m, x0):
+                check_space_type(x, "primal")
                 check_space_type(m, "primal")
                 check_space_type(x0, "primal")
-                check_space_type(x, "primal")
 
                 super().__init__(x, deps=[x, x0, m], nl_deps=[x0, m],
                                  ic=False, adj_ic=False)
 
             def forward_solve(self, x, deps=None):
                 _, x0, m = self.dependencies() if deps is None else deps
-                function_set_values(
+                function_assign(
                     x,
-                    0.5 * (function_get_values(x0) ** 2
-                           + function_get_values(m))
-                    / function_get_values(x0))
+                    0.5 * (function_scalar_value(x0) ** 2
+                           + function_scalar_value(m))
+                    / function_scalar_value(x0))
 
             def adjoint_jacobian_solve(self, adj_x, nl_deps, b):
                 return b
@@ -291,19 +292,19 @@ def test_Referrers_FixedPointEquation(setup_test, test_leaks, test_default_dtype
                 if dep_index == 1:
                     x0, m = nl_deps
                     F = function_new_conjugate_dual(x0)
-                    function_set_values(
+                    function_assign(
                         F,
-                        (0.5 * function_get_values(adj_x)
-                         * (function_get_values(m)
-                            / (function_get_values(x0) ** 2) - 1.0)).conjugate())  # noqa: E501
+                        (0.5 * function_scalar_value(adj_x)
+                         * (function_scalar_value(m)
+                            / (function_scalar_value(x0) ** 2) - 1.0)).conjugate())  # noqa: E501
                     return F
                 elif dep_index == 2:
                     x0, m = nl_deps
                     F = function_new_conjugate_dual(x0)
-                    function_set_values(
+                    function_assign(
                         F,
-                        (-0.5 * function_get_values(adj_x)
-                         / function_get_values(x0)).conjugate())
+                        (-0.5 * function_scalar_value(adj_x)
+                         / function_scalar_value(x0)).conjugate())
                     return F
                 else:
                     raise IndexError("Unexpected dep_index")
@@ -311,8 +312,8 @@ def test_Referrers_FixedPointEquation(setup_test, test_leaks, test_default_dtype
         x0 = Constant(1.0, name="x0")
         x1 = Constant(0.0, name="x1")
 
-        eq0 = NewtonIterationSolver(m, x0, x1)
-        eq1 = AssignmentSolver(x1, x0)
+        eq0 = NewtonSolver(x1, m, x0)
+        eq1 = Assignment(x0, x1)
 
         fp_eq = FixedPointSolver(
             [eq0, eq1],
@@ -416,39 +417,15 @@ def test_Referrers_FixedPointEquation(setup_test, test_leaks, test_default_dtype
                                                    (200, 20),
                                                    (200, 50),
                                                    (1000, 50)])
+@pytest.mark.parametrize("prune", [False, True])
 @no_space_type_checking
 @seed_test
 def test_binomial_checkpointing(setup_test, test_leaks, test_default_dtypes,
-                                tmp_path, n_steps, snaps_in_ram):
-    _minimal_n_extra_steps = {}
-
-    def minimal_n_extra_steps(n, s):
-        """
-        Implementation of equation (2) in
-            A. Griewank and A. Walther, "Algorithm 799: Revolve: An
-            implementation of checkpointing for the reverse or adjoint mode of
-            computational differentiation", ACM Transactions on Mathematical
-            Software, 26(1), pp. 19--45, 2000
-        Used in place of their equation (3) to allow verification without reuse
-        of code used to compute t or evaluate beta.
-        """
-
-        assert n > 0
-        assert s > 0
-        if (n, s) not in _minimal_n_extra_steps:
-            m = n * (n - 1) // 2
-            if s > 1:
-                for i in range(1, n):
-                    m = min(m,
-                            i
-                            + minimal_n_extra_steps(i, s)
-                            + minimal_n_extra_steps(n - i, s - 1))
-            _minimal_n_extra_steps[(n, s)] = m
-        return _minimal_n_extra_steps[(n, s)]
-
+                                tmp_path, n_steps, snaps_in_ram,
+                                prune):
     n_forward_solves = [0]
 
-    class EmptySolver(Equation):
+    class EmptyEquation(Equation):
         def __init__(self):
             super().__init__([], [], nl_deps=[], ic=False, adj_ic=False)
 
@@ -462,12 +439,12 @@ def test_binomial_checkpointing(setup_test, test_leaks, test_default_dtypes,
 
     def forward(m):
         for n in range(n_steps):
-            EmptySolver().solve()
+            EmptyEquation().solve()
             if n < n_steps - 1:
                 new_block()
 
         J = Functional(name="J")
-        DotProductSolver(m, m, J.fn()).solve()
+        DotProduct(J.function(), m, m).solve()
         return J
 
     m = Constant(1.0, name="m", static=True)
@@ -476,29 +453,85 @@ def test_binomial_checkpointing(setup_test, test_leaks, test_default_dtypes,
     J = forward(m)
     stop_manager()
 
-    dJ = compute_gradient(J, m)
+    dJ = compute_gradient(J, m, prune_replay=prune)
 
-    n_forward_solves_optimal = (n_steps
-                                + minimal_n_extra_steps(n_steps, snaps_in_ram))
     info(f"Number of forward steps        : {n_forward_solves[0]:d}")
-    info(f"Optimal number of forward steps: {n_forward_solves_optimal:d}")
-    assert n_forward_solves[0] == n_forward_solves_optimal
+    if prune:
+        assert n_forward_solves[0] == n_steps
+    else:
+        n_forward_solves_optimal = optimal_steps(n_steps, snaps_in_ram)
+        info(f"Optimal number of forward steps: {n_forward_solves_optimal:d}")
+        assert n_forward_solves[0] == n_forward_solves_optimal
 
-    min_order = taylor_test(forward, m, J_val=J.value(), dJ=dJ, M0=m)
+    min_order = taylor_test(forward, m, J_val=J.value(), dJ=dJ)
     assert min_order > 1.99
 
 
 @pytest.mark.numpy
-@pytest.mark.parametrize("max_depth", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("max_degree", [1, 2, 3, 4, 5])
 @no_space_type_checking
 @seed_test
 def test_TangentLinearMap_finalizes(setup_test, test_leaks, test_default_dtypes,  # noqa: E501
-                                    max_depth):
+                                    max_degree):
     m = Constant(1.0, name="m")
     dm = Constant(1.0, name="dm")
-    add_tlm(m, dm, max_depth=max_depth)
+    configure_tlm(*[(m, dm) for i in range(max_degree)])
 
     start_manager()
     x = Constant(0.0, name="x")
-    DotProductSolver(m, m, x).solve()
+    DotProduct(x, m, m).solve()
     stop_manager()
+
+
+@pytest.mark.numpy
+@seed_test
+def test_tlm_annotation(setup_test, test_leaks):
+    F = Constant(1.0, name="F")
+    zeta = Constant(1.0, name="zeta")
+    G = Constant(1.0, name="G")
+
+    reset_manager()
+    configure_tlm((F, zeta))
+    start_manager()
+    Assignment(G, F).solve()
+    stop_manager()
+
+    assert len(manager()._blocks) == 0 and len(manager()._block) == 2
+
+    reset_manager()
+    configure_tlm((F, zeta))
+    start_manager()
+    stop_annotating()
+    Assignment(G, F).solve()
+    stop_manager()
+
+    assert len(manager()._blocks) == 0 and len(manager()._block) == 0
+
+    reset_manager()
+    configure_tlm((F, zeta), (F, zeta))
+    manager().function_tlm(G, (F, zeta), (F, zeta))
+    start_manager()
+    Assignment(G, F).solve()
+    stop_manager()
+
+    assert len(manager()._blocks) == 0 and len(manager()._block) == 3
+
+    reset_manager()
+    configure_tlm((F, zeta), (F, zeta))
+    configure_tlm((F, zeta), annotate=False)
+    manager().function_tlm(G, (F, zeta), (F, zeta))
+    start_manager()
+    Assignment(G, F).solve()
+    stop_manager()
+
+    assert len(manager()._blocks) == 0 and len(manager()._block) == 1
+
+    reset_manager()
+    configure_tlm((F, zeta))
+    configure_tlm((F, zeta), (F, zeta), annotate=False)
+    manager().function_tlm(G, (F, zeta), (F, zeta))
+    start_manager()
+    Assignment(G, F).solve()
+    stop_manager()
+
+    assert len(manager()._blocks) == 0 and len(manager()._block) == 2

@@ -20,14 +20,15 @@
 
 from .backend import backend_Constant, backend_DirichletBC, backend_Function, \
     backend_ScalarType
-from ..interface import SpaceInterface, add_interface, function_caches, \
-    function_comm, function_dtype, function_id, function_is_cached, \
-    function_is_checkpointed, function_is_static, function_name, \
-    function_replacement, function_space, function_space_type, is_function, \
-    space_comm
+from ..interface import DEFAULT_COMM, SpaceInterface, add_interface, \
+    comm_parent, function_caches, function_comm, function_dtype, function_id, \
+    function_is_cached, function_is_checkpointed, function_is_static, \
+    function_name, function_replacement, function_space, function_space_type, \
+    is_function, space_comm
 from ..interface import FunctionInterface as _FunctionInterface
 
 from ..caches import Caches
+from ..overloaded_float import SymbolicFloat
 
 import mpi4py.MPI as MPI
 import numpy as np
@@ -52,7 +53,6 @@ __all__ = \
         "eliminate_zeros",
         "extract_coefficients",
         "new_count",
-        "replaced_expr",
         "replaced_form"
     ]
 
@@ -132,6 +132,8 @@ class ConstantInterface(_FunctionInterface):
         self.assign(value, annotate=False, tlm=False)
 
     def _assign(self, y):
+        if isinstance(y, SymbolicFloat):
+            y = y.value()
         if isinstance(y, (int, np.integer,
                           float, np.floating,
                           complex, np.complexfloating)):
@@ -141,15 +143,17 @@ class ConstantInterface(_FunctionInterface):
             else:
                 value = np.full(self.ufl_shape, dtype(y), dtype=dtype)
                 value = backend_Constant(value)
-        else:
-            assert isinstance(y, backend_Constant)
+        elif isinstance(y, backend_Constant):
             value = y
+        else:
+            raise TypeError(f"Unexpected type: {type(y)}")
         self.assign(value, annotate=False, tlm=False)
 
-    def _axpy(self, *args):  # self, alpha, x
-        alpha, x = args
+    def _axpy(self, alpha, x, /):
         dtype = function_dtype(self)
         alpha = dtype(alpha)
+        if isinstance(x, SymbolicFloat):
+            x = x.value()
         if isinstance(x, (int, np.integer,
                           float, np.floating,
                           complex, np.complexfloating)):
@@ -159,22 +163,22 @@ class ConstantInterface(_FunctionInterface):
                 value = self.values() + alpha * dtype(x)
                 value.shape = self.ufl_shape
                 value = backend_Constant(value)
-        else:
-            assert isinstance(x, backend_Constant)
+        elif isinstance(x, backend_Constant):
             if len(self.ufl_shape) == 0:
                 value = (dtype(self) + alpha * dtype(x))
             else:
                 value = self.values() + alpha * x.values()
                 value.shape = self.ufl_shape
                 value = backend_Constant(value)
+        else:
+            raise TypeError(f"Unexpected type: {type(x)}")
         self.assign(value, annotate=False, tlm=False)
 
     def _inner(self, y):
-        assert isinstance(y, backend_Constant)
-        return y.values().conjugate().dot(self.values())
-
-    def _max_value(self):
-        return self.values().max()
+        if isinstance(y, backend_Constant):
+            return y.values().conjugate().dot(self.values())
+        else:
+            raise TypeError(f"Unexpected type: {type(y)}")
 
     def _sum(self):
         return self.values().sum()
@@ -289,9 +293,9 @@ class Constant(backend_Constant):
         # Default comm
         if comm is None:
             if space is None:
-                comm = MPI.COMM_WORLD
+                comm = DEFAULT_COMM
             else:
-                comm = space_comm(space)
+                comm = comm_parent(space_comm(space))
 
         if cache is None:
             cache = static
@@ -346,44 +350,48 @@ def extract_coefficients(expr):
 
 
 def eliminate_zeros(expr, *, force_non_empty_form=False):
-    if isinstance(expr, ufl.classes.Form):
-        if force_non_empty_form:
-            if "_tlm_adjoint__simplified_form_non_empty" in expr._cache:
-                return expr._cache["_tlm_adjoint__simplified_form_non_empty"]
-        else:
-            if "_tlm_adjoint__simplified_form" in expr._cache:
-                return expr._cache["_tlm_adjoint__simplified_form"]
-
-    replace_map = {}
-    for c in extract_coefficients(expr):
-        if isinstance(c, Zero):
-            replace_map[c] = ufl.classes.Zero(shape=c.ufl_shape)
-
-    if len(replace_map) == 0:
-        simplified_expr = expr
+    if isinstance(expr, ufl.classes.Form) \
+            and "_tlm_adjoint__simplified_form" in expr._cache:
+        simplified_expr = expr._cache["_tlm_adjoint__simplified_form"]
     else:
-        simplified_expr = ufl.replace(expr, replace_map)
-    if isinstance(expr, ufl.classes.Form):
-        expr._cache["_tlm_adjoint__simplified_form"] = simplified_expr
+        replace_map = {}
+        for c in extract_coefficients(expr):
+            if isinstance(c, Zero):
+                replace_map[c] = ufl.classes.Zero(shape=c.ufl_shape)
+
+        if len(replace_map) == 0:
+            simplified_expr = expr
+        else:
+            simplified_expr = ufl.replace(expr, replace_map)
+
+        if isinstance(expr, ufl.classes.Form):
+            expr._cache["_tlm_adjoint__simplified_form"] = simplified_expr
 
     if force_non_empty_form \
             and isinstance(simplified_expr, ufl.classes.Form) \
             and simplified_expr.empty():
-        # Inefficient, but it is very difficult to generate a non-empty but
-        # zero valued form
-        arguments = expr.arguments()
-        domain = expr.ufl_domains()[0]
-        zero = ZeroConstant(domain=domain)
-        if len(arguments) == 0:
-            simplified_expr = zero * ufl.ds
-        elif len(arguments) == 1:
-            test, = arguments
-            simplified_expr = zero * ufl.conj(test) * ufl.ds
+        if "_tlm_adjoint__simplified_form_non_empty" in expr._cache:
+            simplified_expr = expr._cache["_tlm_adjoint__simplified_form_non_empty"]  # noqa: E501
         else:
-            test, trial = arguments
-            simplified_expr = zero * ufl.inner(trial, test) * ufl.ds
-    if isinstance(expr, ufl.classes.Form):
-        expr._cache["_tlm_adjoint__simplified_form_non_empty"] = simplified_expr  # noqa: E501
+            # Inefficient, but it is very difficult to generate a non-empty but
+            # zero valued form
+            arguments = expr.arguments()
+            if isinstance(expr, ufl.classes.Expr):
+                domain, = ufl.domain.extract_domains(expr)
+            else:
+                domain, = expr.ufl_domains()
+            zero = ZeroConstant(domain=domain)
+            if len(arguments) == 0:
+                simplified_expr = zero * ufl.ds
+            elif len(arguments) == 1:
+                test, = arguments
+                simplified_expr = zero * ufl.conj(test) * ufl.ds
+            else:
+                test, trial = arguments
+                simplified_expr = zero * ufl.inner(trial, test) * ufl.ds
+
+            if isinstance(expr, ufl.classes.Form):
+                expr._cache["_tlm_adjoint__simplified_form_non_empty"] = simplified_expr  # noqa: E501
 
     return simplified_expr
 
@@ -571,14 +579,6 @@ class ReplacementConstant(backend_Constant, Replacement):
 class ReplacementFunction(backend_Function, Replacement):
     def __init__(self, x):
         Replacement.__init__(self, x)
-
-
-def replaced_expr(expr):
-    replace_map = {}
-    for c in ufl.algorithms.extract_coefficients(expr):
-        if is_function(c):
-            replace_map[c] = function_replacement(c)
-    return ufl.replace(expr, replace_map)
 
 
 def replaced_form(form):

@@ -18,24 +18,26 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with tlm_adjoint.  If not, see <https://www.gnu.org/licenses/>.
 
-from .backend import Parameters, Projector, backend_Constant, \
+from .backend import Interpolator, Parameters, Projector, backend_Constant, \
     backend_DirichletBC, backend_Function, backend_LinearSolver, \
     backend_LinearVariationalProblem, backend_LinearVariationalSolver, \
     backend_NonlinearVariationalSolver, backend_Vector, backend_assemble, \
-    backend_project, backend_solve, extract_args, extract_linear_solver_args, \
-    parameters
-from ..interface import check_space_type, function_new, \
-    function_update_state, space_new
+    backend_interpolate, backend_project, backend_solve, extract_args, \
+    extract_linear_solver_args, parameters
+from ..interface import check_space_type, function_new, function_space, \
+    function_update_state, is_function, space_id, space_new
 from .backend_code_generator_interface import copy_parameters_dict, \
     update_parameters_dict
 
-from ..manager import annotation_enabled, tlm_enabled
+from ..manager import annotation_enabled, paused_manager, tlm_enabled
 
-from .equations import AssignmentSolver, EquationSolver, ProjectionSolver, \
+from ..equations import Assignment
+from .equations import Assembly, EquationSolver, ExprEvaluation, Projection, \
     linear_equation_new_x
-from .firedrake_equations import LocalProjectionSolver
+from .firedrake_equations import LocalProjection
 
 import copy
+import numpy as np
 import ufl
 
 __all__ = \
@@ -45,6 +47,7 @@ __all__ = \
         "LinearVariationalSolver",
         "NonlinearVariationalSolver",
         "assemble",
+        "interpolate",
         "project",
         "solve"
     ]
@@ -114,7 +117,7 @@ def extract_args_assemble_form(form, tensor=None, bcs=None, *,
 
 # Aim for compatibility with Firedrake API, git master revision
 # bc79502544ca78c06d60532c2d674b7808aef0af, Mar 30 2022
-def assemble(expr, *args, **kwargs):
+def assemble(expr, *args, annotate=None, tlm=None, **kwargs):
     if not isinstance(expr, ufl.classes.Form):
         return backend_assemble(expr, *args, **kwargs)
 
@@ -143,6 +146,16 @@ def assemble(expr, *args, **kwargs):
         form_compiler_parameters = form_compiler_parameters_
 
         if rank == 1:
+            if annotate is None:
+                annotate = annotation_enabled()
+            if tlm is None:
+                tlm = tlm_enabled()
+            if annotate or tlm:
+                eq = Assembly(
+                    b, form,
+                    form_compiler_parameters=form_compiler_parameters)
+                eq._post_process(annotate=annotate, tlm=tlm)
+
             b._tlm_adjoint__form = form
         b._tlm_adjoint__form_compiler_parameters = form_compiler_parameters
 
@@ -192,6 +205,11 @@ def solve(*args, annotate=None, tlm=None, **kwargs):
             if solver_parameters is None:
                 solver_parameters = {}
 
+            if isinstance(eq_arg.rhs, ufl.classes.Form) \
+                    and (x in eq_arg.lhs.coefficients()
+                         or x in eq_arg.rhs.coefficients()):
+                # See Firedrake issue #2555
+                raise ValueError("Invalid dependency")
             if Jp is not None:
                 raise NotImplementedError("Preconditioners not supported")
             if M is not None:
@@ -202,9 +220,6 @@ def solve(*args, annotate=None, tlm=None, **kwargs):
                 nullspace=nullspace, transpose_nullspace=transpose_nullspace,
                 near_nullspace=near_nullspace)
 
-            if isinstance(eq_arg.rhs, ufl.classes.Form):
-                eq_arg = linear_equation_new_x(eq_arg, x,
-                                               annotate=annotate, tlm=tlm)
             eq = EquationSolver(
                 eq_arg, x, bcs, J=J,
                 form_compiler_parameters=form_compiler_parameters,
@@ -288,18 +303,18 @@ def project(v, V, bcs=None, solver_parameters=None,
             form_compiler_parameters = {}
         if x in ufl.algorithms.extract_coefficients(v):
             x_old = function_new(x)
-            AssignmentSolver(x, x_old).solve(annotate=annotate, tlm=tlm)
+            Assignment(x_old, x).solve(annotate=annotate, tlm=tlm)
             v = ufl.replace(v, {x: x_old})
         if use_slate_for_inverse:
             if len(bcs) > 0:
                 raise NotImplementedError("Boundary conditions not supported")
-            eq = LocalProjectionSolver(
-                v, x, form_compiler_parameters=form_compiler_parameters,
+            eq = LocalProjection(
+                x, v, form_compiler_parameters=form_compiler_parameters,
                 cache_jacobian=False, cache_rhs_assembly=False)
             eq.solve(annotate=annotate, tlm=tlm)
         else:
-            eq = ProjectionSolver(
-                v, x, bcs, solver_parameters=solver_parameters,
+            eq = Projection(
+                x, v, bcs, solver_parameters=solver_parameters,
                 form_compiler_parameters=form_compiler_parameters,
                 cache_jacobian=False, cache_rhs_assembly=False)
             eq.solve(annotate=annotate, tlm=tlm)
@@ -316,23 +331,33 @@ def project(v, V, bcs=None, solver_parameters=None,
 # Aim for compatibility with Firedrake API, git master revision
 # bc79502544ca78c06d60532c2d674b7808aef0af, Mar 30 2022
 def _Constant_assign(self, value, *, annotate=None, tlm=None):
-    eq = None
-    if isinstance(value, backend_Constant):
-        if annotate is None:
-            annotate = annotation_enabled()
-        if tlm is None:
-            tlm = tlm_enabled()
-        if annotate or tlm:
-            eq = AssignmentSolver(value, self)
-            eq._pre_process(annotate=annotate)
+    if annotate is None:
+        annotate = annotation_enabled()
+    if tlm is None:
+        tlm = tlm_enabled()
+    if annotate or tlm:
+        if isinstance(value, (int, np.integer,
+                              float, np.floating,
+                              complex, np.complexfloating)):
+            Assignment(self, backend_Constant(value)).solve(
+                annotate=annotate, tlm=tlm)
+            return
+        elif isinstance(value, backend_Constant):
+            if value is not self:
+                Assignment(self, value).solve(annotate=annotate, tlm=tlm)
+                return
+        elif isinstance(value, ufl.classes.Expr):
+            if self in ufl.algorithms.extract_coefficients(value):
+                self_old = function_new(self)
+                Assignment(self_old, self).solve(
+                    annotate=annotate, tlm=tlm)
+                value = ufl.replace(value, {self: self_old})
+            ExprEvaluation(self, value).solve(annotate=annotate, tlm=tlm)
+            return
 
     return_value = backend_Constant._tlm_adjoint__orig_assign(
         self, value)
-
     function_update_state(self)
-    if eq is not None:
-        eq._post_process(annotate=annotate, tlm=tlm)
-
     return return_value
 
 
@@ -344,16 +369,31 @@ backend_Constant.assign = _Constant_assign
 # Aim for compatibility with Firedrake API, git master revision
 # bc79502544ca78c06d60532c2d674b7808aef0af, Mar 30 2022
 def _Function_assign(self, expr, subset=None, *, annotate=None, tlm=None):
-    if isinstance(expr, backend_Function) \
-            and subset is None \
-            and self.function_space() == expr.function_space():
+    if subset is None:
         if annotate is None:
             annotate = annotation_enabled()
         if tlm is None:
             tlm = tlm_enabled()
         if annotate or tlm:
-            AssignmentSolver(expr, self).solve(annotate=annotate, tlm=tlm)
-            return self
+            if isinstance(expr, (int, np.integer,
+                                 float, np.floating,
+                                 complex, np.complexfloating)):
+                expr = backend_Constant(expr)
+            if isinstance(expr, backend_Function) \
+                    and space_id(function_space(expr)) == space_id(function_space(self)):  # noqa: E501
+                if expr is not self:
+                    Assignment(self, expr).solve(
+                        annotate=annotate, tlm=tlm)
+                    return self
+            elif isinstance(expr, ufl.classes.Expr):
+                if self in ufl.algorithms.extract_coefficients(expr):
+                    self_old = function_new(self)
+                    Assignment(self_old, self).solve(
+                        annotate=annotate, tlm=tlm)
+                    expr = ufl.replace(expr, {self: self_old})
+                ExprEvaluation(self, expr).solve(
+                    annotate=annotate, tlm=tlm)
+                return self
 
     return_value = backend_Function._tlm_adjoint__orig_assign(
         self, expr, subset=subset)
@@ -484,11 +524,13 @@ class LinearVariationalSolver(backend_LinearVariationalSolver):
 
             A = self._problem.J
             b = self._problem._tlm_adjoint__b
+            if x in A.coefficients() or x in b.coefficients():
+                # See Firedrake issue #2555
+                raise ValueError("Invalid dependency")
 
             eq = EquationSolver(
-                linear_equation_new_x(A == b, x,
-                                      annotate=annotate, tlm=tlm),
-                x, self._problem.bcs, solver_parameters=solver_parameters,
+                A == b, x, self._problem.bcs,
+                solver_parameters=solver_parameters,
                 form_compiler_parameters=form_compiler_parameters,
                 cache_jacobian=self._problem._constant_jacobian,
                 cache_rhs_assembly=False)
@@ -551,3 +593,68 @@ class NonlinearVariationalSolver(backend_NonlinearVariationalSolver):
         else:
             super().solve(bounds=bounds)
             function_update_state(self._problem.u)
+
+
+# Aim for compatibility with Firedrake API, git master revision
+# b195b5c9c05dd2eaa6e920f46af730a0d715e116, Feb 24 2023
+def _Interpolator_interpolate(self, *function, output=None, transpose=False,
+                              annotate=None, tlm=None, **kwargs):
+    if annotate is None:
+        annotate = annotation_enabled()
+    if tlm is None:
+        tlm = tlm_enabled()
+    if annotate or tlm:
+        if transpose:
+            raise NotImplementedError("transpose not supported")
+
+        args = ufl.algorithms.extract_arguments(self.expr)
+        if len(args) != len(function):
+            raise TypeError("Unexpected number of functions")
+        expr = ufl.replace(self.expr, dict(zip(args, function)))
+
+        if output is None:
+            if is_function(self.V):
+                output = self.V
+            else:
+                output = space_new(self.V)
+
+        eq = ExprEvaluation(output, expr)
+        eq._pre_process(annotate=annotate)
+        Interpolator._tlm_adjoint__orig_interpolate(
+            self, *function, output=output, transpose=transpose,
+            **kwargs)
+        eq._post_process(annotate=annotate, tlm=tlm)
+    else:
+        output = Interpolator._tlm_adjoint__orig_interpolate(
+            self, *function, output=output, transpose=transpose,
+            **kwargs)
+        function_update_state(output)
+    return output
+
+
+assert not hasattr(Interpolator, "_tlm_adjoint__orig_interpolate")
+Interpolator._tlm_adjoint__orig_interpolate = Interpolator.interpolate
+Interpolator.interpolate = _Interpolator_interpolate
+
+
+def _Function_interpolate(*args, annotate=None, tlm=None, **kwargs):
+    if annotate is None:
+        annotate = annotation_enabled()
+    if tlm is None:
+        tlm = tlm_enabled()
+    with paused_manager(annotate=not annotate, tlm=not tlm):
+        return backend_Function._tlm_adjoint__orig_interpolate(*args, **kwargs)
+
+
+assert not hasattr(backend_Function, "_tlm_adjoint__orig_interpolate")
+backend_Function._tlm_adjoint__orig_interpolate = backend_Function.interpolate
+backend_Function.interpolate = _Function_interpolate
+
+
+def interpolate(*args, annotate=None, tlm=None, **kwargs):
+    if annotate is None:
+        annotate = annotation_enabled()
+    if tlm is None:
+        tlm = tlm_enabled()
+    with paused_manager(annotate=not annotate, tlm=not tlm):
+        return backend_interpolate(*args, **kwargs)

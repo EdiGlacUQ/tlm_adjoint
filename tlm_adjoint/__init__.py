@@ -23,10 +23,12 @@ from .eigendecomposition import *    # noqa: F401
 from .equations import *             # noqa: F401
 from .functional import *            # noqa: F401
 from .hessian import *               # noqa: F401
+from .hessian import GeneralGaussNewton as GaussNewton  # noqa: F401
 from .hessian import GeneralHessian as Hessian  # noqa: F401
 from .hessian_optimization import *  # noqa: F401
 from .interface import *             # noqa: F401
 from .manager import *               # noqa: F401
 from .optimization import *          # noqa: F401
+from .overloaded_float import *      # noqa: F401
 from .tlm_adjoint import *           # noqa: F401
 from .verification import *          # noqa: F401

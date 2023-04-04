@@ -18,14 +18,12 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with tlm_adjoint.  If not, see <https://www.gnu.org/licenses/>.
 
-from .backend import TestFunction, TrialFunction, adjoint, backend_Constant, \
+from .backend import TestFunction, TrialFunction, adjoint, \
     backend_DirichletBC, backend_Function, backend_FunctionSpace, parameters
-from ..interface import check_space_type, function_assign, \
-    function_get_values, function_id, function_inner, function_is_scalar, \
-    function_new, function_new_conjugate_dual, function_replacement, \
-    function_scalar_value, function_set_values, function_space, \
-    function_update_caches, function_update_state, function_zero, \
-    is_function, space_id
+from ..interface import check_space_type, function_assign, function_id, \
+    function_is_scalar, function_new, function_new_conjugate_dual, \
+    function_replacement, function_scalar_value, function_space, \
+    function_update_caches, function_zero, is_function
 from .backend_code_generator_interface import assemble, \
     assemble_linear_solver, complex_mode, copy_parameters_dict, \
     form_form_compiler_parameters, function_vector, homogenize, \
@@ -34,27 +32,32 @@ from .backend_code_generator_interface import assemble, \
     rhs_addto, rhs_copy, solve, update_parameters_dict, verify_assembly
 
 from ..caches import CacheRef
-from ..equations import AssignmentSolver, Equation, NullSolver, \
+from ..equations import Assignment, Equation, ZeroAssignment, \
     get_tangent_linear
+from ..overloaded_float import SymbolicFloat
 
 from .caches import assembly_cache, form_neg, is_cached, linear_solver_cache, \
     split_form
 from .functions import bcs_is_cached, bcs_is_homogeneous, bcs_is_static, \
     eliminate_zeros, extract_coefficients
 
-import copy
 import numpy as np
 import ufl
 import warnings
 
 __all__ = \
     [
+        "Assembly",
+        "DirichletBCApplication",
+        "EquationSolver",
+        "ExprEvaluation",
+        "Projection",
+        "linear_equation_new_x",
+
         "AssembleSolver",
         "DirichletBCSolver",
-        "EquationSolver",
         "ExprEvaluationSolver",
-        "ProjectionSolver",
-        "linear_equation_new_x"
+        "ProjectionSolver"
     ]
 
 
@@ -88,19 +91,11 @@ def extract_dependencies(expr):
     nl_deps = {}
     for dep in extract_coefficients(expr):
         if is_function(dep):
-            dep_id = function_id(dep)
-            if dep_id not in deps:
-                deps[dep_id] = dep
-            if dep_id not in nl_deps:
-                n_nl_deps = 0
-                for nl_dep in derivative_dependencies(expr, dep):
-                    if is_function(nl_dep):
-                        nl_dep_id = function_id(nl_dep)
-                        if nl_dep_id not in nl_deps:
-                            nl_deps[nl_dep_id] = nl_dep
-                        n_nl_deps += 1
-                if n_nl_deps > 0 and dep_id not in nl_deps:
-                    nl_deps[dep_id] = dep
+            deps.setdefault(function_id(dep), dep)
+            for nl_dep in derivative_dependencies(expr, dep):
+                if is_function(nl_dep):
+                    nl_deps.setdefault(function_id(dep), dep)
+                    nl_deps.setdefault(function_id(nl_dep), nl_dep)
 
     deps = {dep_id: deps[dep_id]
             for dep_id in sorted(deps.keys())}
@@ -125,7 +120,9 @@ class ExprEquation(Equation):
     def _replace_map(self, deps):
         eq_deps = self.dependencies()
         assert len(eq_deps) == len(deps)
-        return dict(zip(eq_deps, deps))
+        return {eq_dep: dep
+                for eq_dep, dep in zip(eq_deps, deps)
+                if not isinstance(eq_dep, SymbolicFloat)}
 
     def _replace(self, expr, deps):
         return ufl.replace(expr, self._replace_map(deps))
@@ -133,19 +130,21 @@ class ExprEquation(Equation):
     def _nonlinear_replace_map(self, nl_deps):
         eq_nl_deps = self.nonlinear_dependencies()
         assert len(eq_nl_deps) == len(nl_deps)
-        return dict(zip(eq_nl_deps, nl_deps))
+        return {eq_nl_dep: nl_dep
+                for eq_nl_dep, nl_dep in zip(eq_nl_deps, nl_deps)
+                if not isinstance(eq_nl_dep, SymbolicFloat)}
 
     def _nonlinear_replace(self, expr, nl_deps):
         return ufl.replace(expr, self._nonlinear_replace_map(nl_deps))
 
 
-class AssembleSolver(ExprEquation):
-    def __init__(self, rhs, x, form_compiler_parameters=None,
+class Assembly(ExprEquation):
+    def __init__(self, x, rhs, *, form_compiler_parameters=None,
                  match_quadrature=None):
         if form_compiler_parameters is None:
             form_compiler_parameters = {}
         if match_quadrature is None:
-            match_quadrature = parameters["tlm_adjoint"]["AssembleSolver"]["match_quadrature"]  # noqa: E501
+            match_quadrature = parameters["tlm_adjoint"]["Assembly"]["match_quadrature"]  # noqa: E501
 
         rhs = ufl.classes.Form(rhs.integrals())
 
@@ -155,8 +154,10 @@ class AssembleSolver(ExprEquation):
             if not function_is_scalar(x):
                 raise ValueError("Rank 0 forms can only be assigned to "
                                  "scalars")
+        elif rank == 1:
+            check_space_type(x, "conjugate_dual")
         else:
-            raise ValueError("Must be a rank 0 form")
+            raise ValueError("Must be a rank 0 or rank 1 form")
 
         deps, nl_deps = extract_dependencies(rhs)
         if function_id(x) in deps:
@@ -177,10 +178,12 @@ class AssembleSolver(ExprEquation):
         super().__init__(x, deps, nl_deps=nl_deps, ic=False, adj_ic=False)
         self._rhs = rhs
         self._form_compiler_parameters = form_compiler_parameters
+        self._rank = rank
 
     def drop_references(self):
         replace_map = {dep: function_replacement(dep)
-                       for dep in self.dependencies()}
+                       for dep in self.dependencies()
+                       if not isinstance(dep, SymbolicFloat)}
 
         super().drop_references()
 
@@ -192,10 +195,16 @@ class AssembleSolver(ExprEquation):
         else:
             rhs = self._replace(self._rhs, deps)
 
-        function_assign(
-            x,
-            assemble(rhs,
-                     form_compiler_parameters=self._form_compiler_parameters))
+        if self._rank == 0:
+            function_assign(
+                x,
+                assemble(rhs, form_compiler_parameters=self._form_compiler_parameters))  # noqa: E501
+        elif self._rank == 1:
+            assemble(
+                rhs, form_compiler_parameters=self._form_compiler_parameters,
+                tensor=function_vector(x))
+        else:
+            raise ValueError("Must be a rank 0 or rank 1 form")
 
     def adjoint_derivative_action(self, nl_deps, dep_index, adj_x):
         # Derived from EquationSolver.derivative_action (see dolfin-adjoint
@@ -217,11 +226,20 @@ class AssembleSolver(ExprEquation):
             return None
 
         dF = self._nonlinear_replace(dF, nl_deps)
-        dF = ufl.Form([integral.reconstruct(integrand=ufl.conj(integral.integrand()))  # noqa: E501
-                       for integral in dF.integrals()])  # dF = adjoint(dF)
-        dF = assemble(
-            dF, form_compiler_parameters=self._form_compiler_parameters)
-        return (-function_scalar_value(adj_x), dF)
+        if self._rank == 0:
+            dF = ufl.classes.Form(
+                [integral.reconstruct(integrand=ufl.conj(integral.integrand()))
+                 for integral in dF.integrals()])  # dF = adjoint(dF)
+            dF = assemble(
+                dF, form_compiler_parameters=self._form_compiler_parameters)
+            return (-function_scalar_value(adj_x), dF)
+        elif self._rank == 1:
+            dF = ufl.action(adjoint(dF), coefficient=adj_x)
+            dF = assemble(
+                dF, form_compiler_parameters=self._form_compiler_parameters)
+            return (-1.0, dF)
+        else:
+            raise ValueError("Must be a rank 0 or rank 1 form")
 
     def adjoint_jacobian_solve(self, adj_x, nl_deps, b):
         return b
@@ -238,11 +256,26 @@ class AssembleSolver(ExprEquation):
 
         tlm_rhs = ufl.algorithms.expand_derivatives(tlm_rhs)
         if tlm_rhs.empty():
-            return NullSolver(tlm_map[x])
+            return ZeroAssignment(tlm_map[x])
         else:
-            return AssembleSolver(
-                tlm_rhs, tlm_map[x],
+            return Assembly(
+                tlm_map[x], tlm_rhs,
                 form_compiler_parameters=self._form_compiler_parameters)
+
+
+class AssembleSolver(Assembly):
+    def __init__(self, rhs, x, form_compiler_parameters=None,
+                 match_quadrature=None):
+        warnings.warn("AssembleSolver is deprecated -- "
+                      "use Assembly instead, and transfer AssembleSolver "
+                      "global parameters",
+                      DeprecationWarning, stacklevel=2)
+        if match_quadrature is None:
+            match_quadrature = parameters["tlm_adjoint"]["AssembleSolver"]["match_quadrature"]  # noqa: E501
+        super().__init__(
+            x, rhs,
+            form_compiler_parameters=form_compiler_parameters,
+            match_quadrature=match_quadrature)
 
 
 def unbound_form(form, deps):
@@ -347,7 +380,7 @@ class EquationSolver(ExprEquation):
                         deps[dep_id] = dep
 
         if initial_guess is not None:
-            warnings.warn("'initial_guess' argument is deprecated",
+            warnings.warn("initial_guess argument is deprecated",
                           DeprecationWarning, stacklevel=2)
             if initial_guess == x:
                 initial_guess = None
@@ -539,7 +572,6 @@ class EquationSolver(ExprEquation):
             else:
                 initial_guess = deps[self._initial_guess_index]
             function_assign(x, initial_guess)
-            function_update_state(x)
             function_update_caches(self.x(), value=x)
 
         if self._linear:
@@ -773,7 +805,7 @@ class EquationSolver(ExprEquation):
 
         tlm_rhs = ufl.algorithms.expand_derivatives(tlm_rhs)
         if tlm_rhs.empty():
-            return NullSolver(tlm_map[x])
+            return ZeroAssignment(tlm_map[x])
         else:
             if self._tlm_solver_parameters is None:
                 tlm_solver_parameters = self._linear_solver_parameters
@@ -804,8 +836,7 @@ def linear_equation_new_x(eq, x, manager=None, annotate=None, tlm=None):
     rhs_x_dep = x in rhs.coefficients()
     if lhs_x_dep or rhs_x_dep:
         x_old = function_new(x)
-        AssignmentSolver(x, x_old).solve(manager=manager, annotate=annotate,
-                                         tlm=tlm)
+        Assignment(x_old, x).solve(manager=manager, annotate=annotate, tlm=tlm)
         if lhs_x_dep:
             lhs = ufl.replace(lhs, {x: x_old})
         if rhs_x_dep:
@@ -815,8 +846,8 @@ def linear_equation_new_x(eq, x, manager=None, annotate=None, tlm=None):
         return eq
 
 
-class ProjectionSolver(EquationSolver):
-    def __init__(self, rhs, x, *args, **kwargs):
+class Projection(EquationSolver):
+    def __init__(self, x, rhs, *args, **kwargs):
         space = function_space(x)
         test, trial = TestFunction(space), TrialFunction(space)
         if not isinstance(rhs, ufl.classes.Form):
@@ -825,14 +856,22 @@ class ProjectionSolver(EquationSolver):
                          *args, **kwargs)
 
 
-class DirichletBCSolver(Equation):
-    def __init__(self, y, x, *args, **kwargs):
+class ProjectionSolver(Projection):
+    def __init__(self, rhs, x, *args, **kwargs):
+        warnings.warn("ProjectionSolver is deprecated -- "
+                      "use Projection instead",
+                      DeprecationWarning, stacklevel=2)
+        super().__init__(x, rhs, *args, **kwargs)
+
+
+class DirichletBCApplication(Equation):
+    def __init__(self, x, y, *args, **kwargs):
         check_space_type(x, "primal")
         check_space_type(y, "primal")
 
         super().__init__(x, [x, y], nl_deps=[], ic=False, adj_ic=False)
-        self._bc_args = copy.copy(args)
-        self._bc_kwargs = copy.copy(kwargs)
+        self._bc_args = args
+        self._bc_kwargs = kwargs
 
     def forward_solve(self, x, deps=None):
         _, y = self.dependencies() if deps is None else deps
@@ -862,25 +901,30 @@ class DirichletBCSolver(Equation):
 
         tau_y = get_tangent_linear(y, M, dM, tlm_map)
         if tau_y is None:
-            return NullSolver(tlm_map[x])
+            return ZeroAssignment(tlm_map[x])
         else:
-            return DirichletBCSolver(tau_y, tlm_map[x],
-                                     *self._bc_args, **self._bc_kwargs)
+            return DirichletBCApplication(
+                tlm_map[x], tau_y,
+                *self._bc_args, **self._bc_kwargs)
 
 
-class ExprEvaluationSolver(ExprEquation):
-    def __init__(self, rhs, x):
+class DirichletBCSolver(DirichletBCApplication):
+    def __init__(self, y, x, *args, **kwargs):
+        warnings.warn("DirichletBCSolver is deprecated -- "
+                      "use DirichletBCApplication instead",
+                      DeprecationWarning, stacklevel=2)
+        super().__init__(x, y, *args, **kwargs)
+
+
+class ExprEvaluation(ExprEquation):
+    def __init__(self, x, rhs):
         if isinstance(rhs, ufl.classes.Form):
             raise TypeError("rhs should not be a Form")
 
         deps, nl_deps = extract_dependencies(rhs)
+        if function_id(x) in deps:
+            raise ValueError("Invalid non-linear dependency")
         deps, nl_deps = list(deps.values()), tuple(nl_deps.values())
-        for dep in deps:
-            if dep == x:
-                raise ValueError("Invalid non-linear dependency")
-            if isinstance(dep, backend_Function) \
-                    and space_id(function_space(dep)) != space_id(function_space(x)):  # noqa: E501
-                raise ValueError("Invalid dependency")
         deps.insert(0, x)
 
         super().__init__(x, deps, nl_deps=nl_deps, ic=False, adj_ic=False)
@@ -913,16 +957,8 @@ class ExprEvaluationSolver(ExprEquation):
         dF = eliminate_zeros(dF)
         dF = self._nonlinear_replace(dF, nl_deps)
 
-        dF_val = function_new(self.x())
-        interpolate_expression(dF_val, dF)
-
         F = function_new_conjugate_dual(dep)
-        if isinstance(F, backend_Constant):
-            function_assign(F, function_inner(adj_x, dF_val))
-        else:
-            assert isinstance(F, backend_Function)
-            function_set_values(
-                F, function_get_values(dF_val).conjugate() * function_get_values(adj_x))  # noqa: E501
+        interpolate_expression(F, dF, adj_x=adj_x)
         return (-1.0, F)
 
     def adjoint_jacobian_solve(self, adj_x, nl_deps, b):
@@ -939,9 +975,17 @@ class ExprEvaluationSolver(ExprEquation):
                     tlm_rhs += derivative(self._rhs, dep, argument=tau_dep)
 
         if isinstance(tlm_rhs, ufl.classes.Zero):
-            return NullSolver(tlm_map[x])
+            return ZeroAssignment(tlm_map[x])
         tlm_rhs = ufl.algorithms.expand_derivatives(tlm_rhs)
         if isinstance(tlm_rhs, ufl.classes.Zero):
-            return NullSolver(tlm_map[x])
+            return ZeroAssignment(tlm_map[x])
         else:
-            return ExprEvaluationSolver(tlm_rhs, tlm_map[x])
+            return ExprEvaluation(tlm_map[x], tlm_rhs)
+
+
+class ExprEvaluationSolver(ExprEvaluation):
+    def __init__(self, rhs, x):
+        warnings.warn("ExprEvaluationSolver is deprecated -- "
+                      "use ExprEvaluation instead",
+                      DeprecationWarning, stacklevel=2)
+        super().__init__(x, rhs)

@@ -18,18 +18,38 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with tlm_adjoint.  If not, see <https://www.gnu.org/licenses/>.
 
-import numpy as np
-
 from collections.abc import Mapping
+from collections import deque
+import contextlib
+import copy
 import functools
 import logging
+try:
+    import mpi4py.MPI as MPI
+except ImportError:
+    MPI = None
+import numpy as np
+try:
+    from operator import call
+except ImportError:
+    # For Python < 3.11, following Python 3.11 API
+    def call(obj, /, *args, **kwargs):
+        return obj(*args, **kwargs)
+try:
+    import petsc4py.PETSc as PETSc
+except ImportError:
+    PETSc = None
 import sys
 import warnings
 import weakref
 
 __all__ = \
     [
-        "InterfaceException",
+        "DEFAULT_COMM",
+        "comm_dup",
+        "comm_dup_cached",
+        "comm_parent",
+        "garbage_cleanup",
 
         "add_interface",
         "weakref_method",
@@ -51,6 +71,7 @@ __all__ = \
         "conjugate_space_type",
         "dual_space_type",
         "no_space_type_checking",
+        "paused_space_type_checking",
         "relative_space_type",
         "space_type_warning",
 
@@ -99,19 +120,150 @@ __all__ = \
         "finalize_adjoint_derivative_action",
 
         "functional_term_eq",
-        "time_system_eq",
-
-        "function_max_value",
-        "is_real_function",
-        "real_function_value"
+        "time_system_eq"
     ]
 
 
-class InterfaceException(Exception):  # noqa: N818
-    def __init__(self, *args, **kwargs):
-        warnings.warn("InterfaceException is deprecated",
-                      DeprecationWarning, stacklevel=2)
-        super().__init__(*args, **kwargs)
+if MPI is None:
+    # As for mpi4py 3.1.4 API
+    class SerialComm:
+        _id_counter = [-1]
+
+        def __init__(self, *, _id=None):
+            self._id = _id
+            if self._id is None:
+                self._id = self._id_counter[0]
+                self._id_counter[0] -= 1
+
+        @property
+        def rank(self):
+            return 0
+
+        @property
+        def size(self):
+            return 1
+
+        def Dup(self, info=None):
+            return SerialComm()
+
+        def Free(self):
+            pass
+
+        def allgather(self, sendobj):
+            return [copy.deepcopy(sendobj)]
+
+        def barrier(self):
+            pass
+
+        def bcast(self, obj, root=0):
+            return copy.deepcopy(obj)
+
+        def gather(self, sendobj, root=0):
+            assert root == 0
+            return [copy.deepcopy(sendobj)]
+
+        def py2f(self):
+            return self._id
+
+        def f2py(self, arg):
+            return SerialComm(_id=arg)
+
+        def scatter(self, sendobj, root=0):
+            assert root == 0
+            sendobj, = sendobj
+            return copy.deepcopy(sendobj)
+
+    DEFAULT_COMM = SerialComm()
+
+    f2py = DEFAULT_COMM.f2py
+
+    def comm_finalize(comm, finalize_callback,
+                      *args, **kwargs):
+        weakref.finalize(comm, finalize_callback,
+                         *args, **kwargs)
+else:
+    DEFAULT_COMM = MPI.COMM_WORLD
+
+    f2py = MPI.Comm.f2py
+
+    _comm_finalize_key = MPI.Comm.Create_keyval(
+        delete_fn=lambda comm, key, finalizes:
+        deque(map(call, finalizes), maxlen=0))
+
+    # Similar to weakref.finalize behaviour with atexit=False
+    def comm_finalize(comm, finalize_callback,
+                      *args, **kwargs):
+        finalizes = comm.Get_attr(_comm_finalize_key)
+        if finalizes is None:
+            finalizes = []
+            comm.Set_attr(_comm_finalize_key, finalizes)
+        finalizes.append(lambda: finalize_callback(*args, **kwargs))
+
+
+_parent_comms = {}
+
+
+def comm_parent(dup_comm):
+    comm_py2f = _parent_comms.get(dup_comm.py2f(), None)
+    if comm_py2f is None:
+        return dup_comm
+    else:
+        return f2py(comm_py2f)
+
+
+def comm_dup(comm):
+    if MPI is not None and comm is MPI.COMM_NULL:
+        return comm
+
+    dup_comm = comm.Dup()
+    _parent_comms[dup_comm.py2f()] = comm.py2f()
+
+    def finalize_callback(dup_comm_py2f):
+        if MPI is not None and not MPI.Is_finalized():
+            dup_comm = f2py(dup_comm_py2f)
+            dup_comm.Free()
+        _parent_comms.pop(dup_comm_py2f, None)
+
+    weakref.finalize(dup_comm, finalize_callback,
+                     dup_comm.py2f())
+
+    return dup_comm
+
+
+_dup_comms = {}
+
+
+def comm_dup_cached(comm):
+    if MPI is not None and comm is MPI.COMM_NULL:
+        return comm
+
+    dup_comm = _dup_comms.get(comm.py2f(), None)
+
+    if dup_comm is None:
+        dup_comm = comm.Dup()
+        _parent_comms[dup_comm.py2f()] = comm.py2f()
+        _dup_comms[comm.py2f()] = dup_comm
+
+        def finalize_callback(comm_py2f, dup_comm):
+            if MPI is not None and not MPI.Is_finalized():
+                dup_comm.Free()
+            _parent_comms.pop(dup_comm.py2f(), None)
+            _dup_comms.pop(comm_py2f, None)
+
+        comm_finalize(comm, finalize_callback,
+                      comm.py2f(), dup_comm)
+
+    return dup_comm
+
+
+def garbage_cleanup(comm):
+    if PETSc is not None and hasattr(PETSc, "garbage_cleanup"):
+        while True:
+            PETSc.garbage_cleanup(comm)
+            parent_comm = comm_parent(comm)
+            if parent_comm.py2f() == comm.py2f():
+                break
+            comm = parent_comm
 
 
 def weakref_method(fn, obj):
@@ -257,23 +409,29 @@ def conjugate_dual_space_type(space_type):
             "dual": "conjugate", "conjugate_dual": "primal"}[space_type]
 
 
-_check_space_types = [True]
+_check_space_types = 0
 
 
 def no_space_type_checking(fn):
     @functools.wraps(fn)
     def wrapped_fn(*args, **kwargs):
-        check_space_types = _check_space_types[0]
-        _check_space_types[0] = False
-        try:
+        with paused_space_type_checking():
             return fn(*args, **kwargs)
-        finally:
-            _check_space_types[0] = check_space_types
     return wrapped_fn
 
 
+@contextlib.contextmanager
+def paused_space_type_checking():
+    global _check_space_types
+    _check_space_types += 1
+    try:
+        yield
+    finally:
+        _check_space_types -= 1
+
+
 def space_type_warning(msg, *, stacklevel=1):
-    if _check_space_types[0]:
+    if _check_space_types == 0:
         warnings.warn(msg, stacklevel=stacklevel + 1)
 
 
@@ -313,10 +471,10 @@ class FunctionInterface:
     names = ("_comm", "_space", "_space_type", "_dtype", "_id", "_name",
              "_state", "_update_state", "_is_static", "_is_cached",
              "_is_checkpointed", "_caches", "_zero", "_assign", "_axpy",
-             "_inner", "_max_value", "_sum", "_linf_norm", "_local_size",
-             "_global_size", "_local_indices", "_get_values", "_set_values",
-             "_new", "_copy", "_replacement", "_is_replacement", "_is_scalar",
-             "_scalar_value", "_is_alias")
+             "_inner", "_sum", "_linf_norm", "_local_size", "_global_size",
+             "_local_indices", "_get_values", "_set_values", "_new", "_copy",
+             "_replacement", "_is_replacement", "_is_scalar", "_scalar_value",
+             "_is_alias")
 
     def __init__(self):
         raise RuntimeError("Cannot instantiate FunctionInterface object")
@@ -363,13 +521,10 @@ class FunctionInterface:
     def _assign(self, y):
         raise NotImplementedError("Method not overridden")
 
-    def _axpy(self, *args):  # self, alpha, x
+    def _axpy(self, alpha, x, /):
         raise NotImplementedError("Method not overridden")
 
     def _inner(self, y):
-        raise NotImplementedError("Method not overridden")
-
-    def _max_value(self):
         raise NotImplementedError("Method not overridden")
 
     def _sum(self):
@@ -512,10 +667,9 @@ def function_assign(x, y):
     function_update_state(x)
 
 
-def function_axpy(*args):  # y, alpha, x
-    y, alpha, x = args
-    if is_function(y):
-        check_space_types(x, y)
+def function_axpy(y, alpha, x, /):
+    if is_function(x):
+        check_space_types(y, x)
     y._tlm_adjoint__function_interface_axpy(alpha, x)
     function_update_state(y)
 
@@ -524,12 +678,6 @@ def function_inner(x, y):
     if is_function(y):
         check_space_types_conjugate_dual(x, y)
     return x._tlm_adjoint__function_interface_inner(y)
-
-
-def function_max_value(x):
-    warnings.warn("function_max_value is deprecated",
-                  DeprecationWarning, stacklevel=2)
-    return x._tlm_adjoint__function_interface_max_value()
 
 
 def function_sum(x):
@@ -613,20 +761,6 @@ def function_is_replacement(x):
     return x._tlm_adjoint__function_interface_is_replacement()
 
 
-def is_real_function(x):
-    warnings.warn("is_real_function is deprecated -- "
-                  "use function_is_scalar instead",
-                  DeprecationWarning, stacklevel=2)
-    return function_is_scalar(x)
-
-
-def real_function_value(x):
-    warnings.warn("real_function_value is deprecated -- "
-                  "use function_scalar_value instead",
-                  DeprecationWarning, stacklevel=2)
-    return function_scalar_value(x)
-
-
 def function_is_scalar(x):
     return x._tlm_adjoint__function_interface_is_scalar()
 
@@ -658,13 +792,7 @@ def subtract_adjoint_derivative_action(x, y):
             pass
         elif is_function(y):
             check_space_types(x, y)
-            if isinstance(y._tlm_adjoint__function_interface,
-                          type(x._tlm_adjoint__function_interface)):
-                function_axpy(x, -1.0, y)
-            else:
-                function_set_values(x,
-                                    function_get_values(x)
-                                    - function_get_values(y))
+            function_axpy(x, -1.0, y)
         elif isinstance(y, tuple) \
                 and len(y) == 2 \
                 and isinstance(y[0], (int, np.integer,
@@ -674,13 +802,7 @@ def subtract_adjoint_derivative_action(x, y):
             alpha, y = y
             alpha = function_dtype(x)(alpha)
             check_space_types(x, y)
-            if isinstance(y._tlm_adjoint__function_interface,
-                          type(x._tlm_adjoint__function_interface)):
-                function_axpy(x, -alpha, y)
-            else:
-                function_set_values(x,
-                                    function_get_values(x)
-                                    - alpha * function_get_values(y))
+            function_axpy(x, -alpha, y)
         else:
             raise RuntimeError("Unexpected case encountered in "
                                "subtract_adjoint_derivative_action")
@@ -707,9 +829,9 @@ def add_functional_term_eq(backend, fn):
     _functional_term_eq[backend] = fn
 
 
-def functional_term_eq(term, x):
+def functional_term_eq(x, term):
     for fn in _functional_term_eq.values():
-        eq = fn(term, x)
+        eq = fn(x=x, term=term)
         if eq != NotImplemented:
             return eq
     raise RuntimeError("Unexpected case encountered in functional_term_eq")

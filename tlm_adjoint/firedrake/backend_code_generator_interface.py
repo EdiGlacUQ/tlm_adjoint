@@ -18,12 +18,13 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with tlm_adjoint.  If not, see <https://www.gnu.org/licenses/>.
 
-from .backend import FunctionSpace, Parameters, backend_Constant, \
-    backend_DirichletBC, backend_Function, backend_LinearSolver, \
-    backend_Matrix, backend_assemble, backend_solve, complex_mode, \
-    extract_args, homogenize, parameters
-from ..interface import check_space_type, check_space_types, function_axpy, \
-    function_copy, function_dtype, function_space_type, space_new
+from .backend import FunctionSpace, Interpolator, Parameters, TestFunction, \
+    backend_Constant, backend_DirichletBC, backend_Function, \
+    backend_LinearSolver, backend_Matrix, backend_assemble, backend_solve, \
+    complex_mode, extract_args, homogenize, parameters
+from ..interface import check_space_type, check_space_types, function_assign, \
+    function_axpy, function_copy, function_dtype, function_inner, \
+    function_new_conjugate_dual, function_space, function_space_type, space_new
 
 from .functions import eliminate_zeros
 
@@ -62,29 +63,20 @@ __all__ = \
     ]
 
 
-if "tlm_adjoint" not in parameters:
-    parameters["tlm_adjoint"] = {}
-_parameters = parameters["tlm_adjoint"]
-if "AssembleSolver" not in _parameters:
-    _parameters["AssembleSolver"] = {}
-if "match_quadrature" not in _parameters["AssembleSolver"]:
-    _parameters["AssembleSolver"]["match_quadrature"] = False
-if "EquationSolver" not in _parameters:
-    _parameters["EquationSolver"] = {}
-if "enable_jacobian_caching" not in _parameters["EquationSolver"]:
-    _parameters["EquationSolver"]["enable_jacobian_caching"] = True
-if "cache_rhs_assembly" not in _parameters["EquationSolver"]:
-    _parameters["EquationSolver"]["cache_rhs_assembly"] = True
-if "match_quadrature" not in _parameters["EquationSolver"]:
-    _parameters["EquationSolver"]["match_quadrature"] = False
-if "defer_adjoint_assembly" not in _parameters["EquationSolver"]:
-    _parameters["EquationSolver"]["defer_adjoint_assembly"] = False
-if "assembly_verification" not in _parameters:
-    _parameters["assembly_verification"] = {}
-if "jacobian_tolerance" not in _parameters["assembly_verification"]:
-    _parameters["assembly_verification"]["jacobian_tolerance"] = np.inf
-if "rhs_tolerance" not in _parameters["assembly_verification"]:
-    _parameters["assembly_verification"]["rhs_tolerance"] = np.inf
+_parameters = parameters.setdefault("tlm_adjoint", {})
+_parameters.setdefault("Assembly", {})
+_parameters["Assembly"].setdefault("match_quadrature", False)
+_parameters.setdefault("EquationSolver", {})
+_parameters["EquationSolver"].setdefault("enable_jacobian_caching", True)
+_parameters["EquationSolver"].setdefault("cache_rhs_assembly", True)
+_parameters["EquationSolver"].setdefault("match_quadrature", False)
+_parameters["EquationSolver"].setdefault("defer_adjoint_assembly", False)
+_parameters.setdefault("assembly_verification", {})
+_parameters["assembly_verification"].setdefault("jacobian_tolerance", np.inf)
+_parameters["assembly_verification"].setdefault("rhs_tolerance", np.inf)
+# For deprecated AssembleSolver
+_parameters.setdefault("AssembleSolver", {})
+_parameters["AssembleSolver"].setdefault("match_quadrature", False)
 del _parameters
 
 
@@ -113,26 +105,14 @@ def update_parameters_dict(parameters, new_parameters):
 
 def process_solver_parameters(solver_parameters, linear):
     solver_parameters = copy_parameters_dict(solver_parameters)
-    if "tlm_adjoint" in solver_parameters:
-        tlm_adjoint_parameters = solver_parameters["tlm_adjoint"]
-    else:
-        tlm_adjoint_parameters = solver_parameters["tlm_adjoint"] = {}
+    tlm_adjoint_parameters = solver_parameters.setdefault("tlm_adjoint", {})
 
-    if "options_prefix" not in tlm_adjoint_parameters:
-        tlm_adjoint_parameters["options_prefix"] = None
+    tlm_adjoint_parameters.setdefault("options_prefix", None)
+    tlm_adjoint_parameters.setdefault("nullspace", None)
+    tlm_adjoint_parameters.setdefault("transpose_nullspace", None)
+    tlm_adjoint_parameters.setdefault("near_nullspace", None)
 
-    if "nullspace" not in tlm_adjoint_parameters:
-        tlm_adjoint_parameters["nullspace"] = None
-
-    if "transpose_nullspace" not in tlm_adjoint_parameters:
-        tlm_adjoint_parameters["transpose_nullspace"] = None
-
-    if "near_nullspace" not in tlm_adjoint_parameters:
-        tlm_adjoint_parameters["near_nullspace"] = None
-
-    if "ksp_initial_guess_nonzero" not in solver_parameters:
-        solver_parameters["ksp_initial_guess_nonzero"] = False
-    linear_solver_ic = solver_parameters["ksp_initial_guess_nonzero"]
+    linear_solver_ic = solver_parameters.setdefault("ksp_initial_guess_nonzero", False)  # noqa: E501
 
     return (solver_parameters, solver_parameters,
             not linear or linear_solver_ic, linear_solver_ic)
@@ -164,13 +144,12 @@ def assemble_arguments(rank, form_compiler_parameters, solver_parameters):
 
 def strip_terminal_data(form):
     # Replace constants with no domain with constants on the first domain
-    domain = form.ufl_domains()[0]
+    domain, = form.ufl_domains()
 
     replace_map = {}
     replace_map_inverse = {}
     for dep in form.coefficients():
-        if isinstance(dep, backend_Constant) \
-                and dep.ufl_function_space().ufl_domain() is None:
+        if isinstance(dep, backend_Constant) and len(dep.ufl_domains()) == 0:
             dep_arr = np.zeros(dep.ufl_shape, dtype=function_dtype(dep))
             replace_map[dep] = backend_Constant(dep_arr, domain=domain)
             replace_map_inverse[replace_map[dep]] = dep
@@ -516,18 +495,36 @@ def verify_assembly(J, rhs, J_mat, b, bcs, form_compiler_parameters,
                 <= b_tolerance * b_v.norm(norm_type=PETSc.NormType.NORM_INFINITY)  # noqa: E501
 
 
-def interpolate_expression(x, expr):
-    check_space_type(x, "primal")
-    deps = ufl.algorithms.extract_coefficients(expr)
-    for dep in deps:
+def interpolate_expression(x, expr, *, adj_x=None):
+    if adj_x is None:
+        check_space_type(x, "primal")
+    else:
+        check_space_type(x, "conjugate_dual")
+        check_space_type(adj_x, "conjugate_dual")
+    for dep in ufl.algorithms.extract_coefficients(expr):
         check_space_type(dep, "primal")
 
     expr = eliminate_zeros(expr)
 
-    if isinstance(x, backend_Constant):
-        x.assign(expr, annotate=False, tlm=False)
+    if adj_x is None:
+        if isinstance(x, backend_Constant):
+            x.assign(expr, annotate=False, tlm=False)
+        elif isinstance(x, backend_Function):
+            x.interpolate(expr, annotate=False, tlm=False)
+        else:
+            raise TypeError(f"Unexpected type: {type(x)}")
+    elif isinstance(x, backend_Constant):
+        if len(x.ufl_shape) > 0:
+            raise ValueError("Scalar Constant required")
+        expr_val = function_new_conjugate_dual(adj_x)
+        interpolate_expression(expr_val, expr)
+        function_assign(x, function_inner(adj_x, expr_val))
     elif isinstance(x, backend_Function):
-        x.interpolate(expr)
+        x_space = function_space(x)
+        adj_x_space = function_space(adj_x)
+        interp = Interpolator(ufl.conj(expr) * TestFunction(x_space), adj_x_space)  # noqa: E501
+        interp.interpolate(adj_x, transpose=True, output=x,
+                           annotate=False, tlm=False)
     else:
         raise TypeError(f"Unexpected type: {type(x)}")
 

@@ -18,14 +18,16 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with tlm_adjoint.  If not, see <https://www.gnu.org/licenses/>.
 
-from .interface import function_axpy, function_copy, function_get_values, \
-    function_is_cached, function_is_checkpointed, function_is_static, \
-    function_linf_norm, function_local_size, function_new, \
-    function_set_values, is_function
+from .interface import comm_dup, function_axpy, function_copy, \
+    function_get_values, function_is_cached, function_is_checkpointed, \
+    function_is_static, function_linf_norm, function_local_size, \
+    function_new, function_set_values, garbage_cleanup, is_function, space_comm
 
-from .caches import clear_caches
+from .caches import clear_caches, local_caches
 from .functional import Functional
-from .manager import manager as _manager, restore_manager, set_manager
+from .manager import manager as _manager
+from .manager import compute_gradient, reset_manager, restore_manager, \
+    set_manager, start_manager, stop_manager
 
 from collections.abc import Sequence
 import numpy as np
@@ -46,7 +48,9 @@ class OptimizationException(Exception):  # noqa: N818
         super().__init__(*args, **kwargs)
 
 
-def minimize_scipy(forward, M0, J0=None, manager=None, **kwargs):
+@local_caches
+@restore_manager
+def minimize_scipy(forward, M0, *, manager=None, **kwargs):
     """
     Gradient-based minimization using scipy.optimize.minimize.
 
@@ -56,9 +60,6 @@ def minimize_scipy(forward, M0, J0=None, manager=None, **kwargs):
              Functional to be minimized.
     M0       A function, or a sequence of functions. Control parameters initial
              guess.
-    J0       (Optional) Initial functional. If supplied assumes that the
-             forward has already been run, and processed by the equation
-             manager, using the control parameters given by M0.
     manager  (Optional) The equation manager.
 
     Any remaining keyword arguments are passed directly to
@@ -66,26 +67,30 @@ def minimize_scipy(forward, M0, J0=None, manager=None, **kwargs):
 
     Returns a tuple
         (M, return_value)
-    return M is the value of the control parameters obtained, and return_value
+    where M is the value of the control parameters obtained, and return_value
     is the return value of scipy.optimize.minimize.
     """
 
     if not isinstance(M0, Sequence):
-        (M,), return_value = minimize_scipy(forward, [M0], J0=J0,
+        (M,), return_value = minimize_scipy(forward, [M0],
                                             manager=manager, **kwargs)
         return M, return_value
 
     if manager is None:
-        manager = _manager()
-    comm = manager.comm().Dup()
+        manager = _manager().new()
+    set_manager(manager)
+    comm = comm_dup(manager.comm())
 
     N = [0]
     for m0 in M0:
         N.append(N[-1] + function_local_size(m0))
-    size_global = comm.allgather(np.array(N[-1], dtype=np.int64))
-    N_global = [0]
-    for size in size_global:
-        N_global.append(N_global[-1] + size)
+    if comm.rank == 0:
+        size_global = comm.gather(np.array(N[-1], dtype=np.int64), root=0)
+        N_global = [0]
+        for size in size_global:
+            N_global.append(N_global[-1] + size)
+    else:
+        comm.gather(np.array(N[-1], dtype=np.int64), root=0)
 
     def get(F):
         x = np.full(N[-1], np.NAN, dtype=np.float64)
@@ -119,13 +124,11 @@ def minimize_scipy(forward, M0, J0=None, manager=None, **kwargs):
                       cache=function_is_cached(m0),
                       checkpoint=function_is_checkpointed(m0))
          for m0 in M0]
-    J = [Functional(_fn=J0) if is_function(J0) else J0]
-    J_M = [tuple(function_copy(m0) for m0 in M0), M0]
+    J = [None]
+    J_M = [None, None]
 
-    @restore_manager
-    def fun(x, force=False):
+    def fun(x, *, force=False):
         set(M, x)
-        clear_caches(*M)
 
         if not force and J[0] is not None:
             change_norm = 0.0
@@ -142,16 +145,16 @@ def minimize_scipy(forward, M0, J0=None, manager=None, **kwargs):
 
         J_M[0] = tuple(function_copy(m) for m in M)
 
-        set_manager(manager)
-        manager.reset()
-        manager.stop()
+        reset_manager()
+        stop_manager()
         clear_caches()
 
-        manager.start()
+        start_manager()
         J[0] = forward(*M)
         if is_function(J[0]):
             J[0] = Functional(_fn=J[0])
-        manager.stop()
+        garbage_cleanup(space_comm(J[0].space()))
+        stop_manager()
 
         J_M[1] = M
 
@@ -167,8 +170,8 @@ def minimize_scipy(forward, M0, J0=None, manager=None, **kwargs):
 
     def jac(x):
         fun(x, force=J_M[1] is None)
-        dJ = manager.compute_gradient(J[0], J_M[1])
-        if manager._cp_manager.is_exhausted():
+        dJ = compute_gradient(J[0], J_M[1])
+        if manager._cp_schedule.is_exhausted():
             J_M[1] = None
         return get(dJ)
 
@@ -200,8 +203,5 @@ def minimize_scipy(forward, M0, J0=None, manager=None, **kwargs):
             else:
                 raise ValueError(f"Unexpected action '{action:s}'")
         set(M, None)
-
-    clear_caches(*M)
-    comm.Free()
 
     return M, return_value

@@ -32,6 +32,7 @@ tlm_adjoint requires:
 
     All backends:
         NumPy
+        SymPy
 
     FEniCS or Firedrake backends:
         UFL
@@ -44,12 +45,14 @@ tlm_adjoint requires:
 
     Firedrake backend:
         Firedrake
-        pyadjoint
 
 tlm_adjoint optionally uses
 
     SciPy, for gradient-based optimization and interpolation equations
     h5py, with the 'mpio' driver for parallel calculations, for HDF5 storage
     petsc4py and slepc4py, for eigendecomposition functionality
+    H-Revolve, for H-Revolve checkpointing schedules
+    more-itertools
+    Numba
 
 License: GNU LGPL version 3

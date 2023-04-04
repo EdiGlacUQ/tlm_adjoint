@@ -70,12 +70,12 @@ def forward(kappa, manager=None, output_filename=None):
                                                "preconditioner": "sor",
                                                "krylov_solver": {"absolute_tolerance": 1.0e-16,  # noqa: E501
                                                                  "relative_tolerance": 1.0e-14}})  # noqa: E501
-    cycle = AssignmentSolver(Psi_np1, Psi_n)
+    cycle = Assignment(Psi_n, Psi_np1)
 
     if output_filename is not None:
         f = File(output_filename, "compressed")
 
-    AssignmentSolver(Psi_0, Psi_n).solve(manager=manager)
+    Assignment(Psi_n, Psi_0).solve(manager=manager)
     if output_filename is not None:
         f << (Psi_n, 0.0)
     for n in range(N):
@@ -96,14 +96,13 @@ def forward(kappa, manager=None, output_filename=None):
     return J
 
 
-add_tlm(kappa, zeta_1)
-add_tlm((kappa, zeta_1), (zeta_2, zeta_3))
+configure_tlm((kappa, zeta_1), ((kappa, zeta_1), (zeta_2, zeta_3)))
 start_manager()
 # J = forward(kappa, output_filename="forward.pvd")
 J = forward(kappa)
-dJ_tlm_1 = J.tlm(kappa, zeta_1)
-dJ_tlm_2 = J.tlm((kappa, zeta_1), (zeta_2, zeta_3))
-ddJ_tlm = dJ_tlm_1.tlm((kappa, zeta_1), (zeta_2, zeta_3))
+dJ_tlm_1 = J.tlm_functional((kappa, zeta_1))
+dJ_tlm_2 = J.tlm_functional(((kappa, zeta_1), (zeta_2, zeta_3)))
+ddJ_tlm = dJ_tlm_1.tlm_functional(((kappa, zeta_1), (zeta_2, zeta_3)))
 stop_manager()
 
 dJ_adj, ddJ_adj, dddJ_adj = compute_gradient(ddJ_tlm, (zeta_3, zeta_2, kappa))

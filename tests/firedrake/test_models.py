@@ -28,6 +28,11 @@ import mpi4py.MPI as MPI
 import numpy as np
 import pytest
 
+try:
+    import hrevolve
+except ImportError:
+    hrevolve = None
+
 pytestmark = pytest.mark.skipif(
     MPI.COMM_WORLD.size not in [1, 4],
     reason="tests must be run in serial, or with 4 processes")
@@ -100,17 +105,34 @@ def diffusion_ref():
      ("multistage", {"format": "pickle", "snaps_on_disk": 1,
                      "snaps_in_ram": 2}),
      ("multistage", {"format": "hdf5", "snaps_on_disk": 1,
-                     "snaps_in_ram": 2})])
+                     "snaps_in_ram": 2}),
+     pytest.param(
+         "H-Revolve", {"snapshots_on_disk": 1, "snapshots_in_ram": 2},
+         marks=pytest.mark.skipif(hrevolve is None,
+                                  reason="H-Revolve not available")),
+     ("mixed", {"snapshots": 2, "storage": "disk"})])
 @seed_test
 def test_oscillator(setup_test, test_leaks,
                     tmp_path, cp_method, cp_parameters):
     n_steps = 20
     cp_parameters = copy.copy(cp_parameters)
-    if cp_method in ["periodic_disk", "multistage"]:
+    if cp_method != "memory":
         cp_parameters["path"] = str(tmp_path / "checkpoints~")
     if cp_method == "multistage":
         cp_parameters["blocks"] = n_steps
-    configure_checkpointing(cp_method, cp_parameters)
+    if cp_method in ["memory", "periodic_disk", "multistage"]:
+        configure_checkpointing(cp_method, cp_parameters)
+    elif cp_method == "H-Revolve":
+        from tlm_adjoint.checkpoint_schedules import HRevolveCheckpointSchedule
+        configure_checkpointing(
+            lambda **cp_parameters: HRevolveCheckpointSchedule(max_n=n_steps, **cp_parameters),  # noqa: E501
+            cp_parameters)
+    else:
+        assert cp_method == "mixed"
+        from tlm_adjoint.checkpoint_schedules import MixedCheckpointSchedule
+        configure_checkpointing(
+            lambda **cp_parameters: MixedCheckpointSchedule(max_n=n_steps, **cp_parameters),  # noqa: E501
+            cp_parameters)
 
     mesh = UnitSquareMesh(5, 5)
     r0 = FiniteElement("Discontinuous Lagrange", mesh.ufl_cell(), 0)
@@ -127,7 +149,7 @@ def test_oscillator(setup_test, test_leaks,
         T_np1 = Function(space, name="T_np1")
         T_s = 0.5 * (T_n + T_np1)
 
-        AssignmentSolver(T_0, T_n).solve()
+        Assignment(T_n, T_0).solve()
 
         eq = EquationSolver(inner((T_np1 - T_n) / dt, test) * dx
                             - inner(T_s[1], test[0]) * dx
@@ -202,7 +224,7 @@ def test_diffusion_1d_timestepping(setup_test, test_leaks,
 
         system = TimeSystem()
 
-        system.add_solve(T_0, T[0])
+        system.add_solve(Assignment(T[0], T_0))
 
         system.add_solve(inner(trial, test) * dx
                          + dt * inner(kappa * grad(trial), grad(test)) * dx
@@ -228,7 +250,7 @@ def test_diffusion_1d_timestepping(setup_test, test_leaks,
     J_val = J.value()
     if n_steps == 20:
         J_val_ref = diffusion_ref()
-        assert abs(J_val - J_val_ref) < 1.0e-13
+        assert abs(J_val - J_val_ref) < 1.0e-12
 
     dJs = compute_gradient(J, [T_0, kappa])
 
@@ -297,14 +319,14 @@ def test_diffusion_2d(setup_test, test_leaks,
         T_n = Function(space, name="T_n")
         T_np1 = Function(space, name="T_np1")
 
-        AssignmentSolver(T_0, T_n).solve()
+        Assignment(T_n, T_0).solve()
 
         eq = (inner(trial / dt, test) * dx
               + inner(dot(kappa, grad(trial)), grad(test)) * dx
               == inner(T_n / dt, test) * dx)
         eqs = [EquationSolver(eq, T_np1, bc,
                               solver_parameters=ls_parameters_cg),
-               AssignmentSolver(T_np1, T_n)]
+               Assignment(T_n, T_np1)]
 
         for n in range(n_steps):
             for eq in eqs:

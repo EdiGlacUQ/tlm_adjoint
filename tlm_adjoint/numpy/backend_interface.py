@@ -18,14 +18,12 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with tlm_adjoint.  If not, see <https://www.gnu.org/licenses/>.
 
-from ..caches import Caches
-from ..functional import Functional as _Functional
-from ..hessian import GeneralGaussNewton as _GaussNewton
-from ..hessian_optimization import CachedGaussNewton as _CachedGaussNewton
-from ..interface import SpaceInterface, add_interface, function_space, \
-    new_function_id, new_space_id, space_id, space_new
+from ..interface import DEFAULT_COMM, SpaceInterface, add_interface, \
+    comm_dup_cached, new_function_id, new_space_id, space_id, space_new
 from ..interface import FunctionInterface as _FunctionInterface
-from ..tlm_adjoint import DEFAULT_COMM
+
+from ..caches import Caches
+from ..overloaded_float import SymbolicFloat
 
 import copy
 import numpy as np
@@ -36,9 +34,6 @@ __all__ = \
         "default_dtype",
         "set_default_dtype",
 
-        "CachedGaussNewton",
-        "Functional",
-        "GaussNewton",
         "new_scalar_function",
 
         "Function",
@@ -54,15 +49,18 @@ __all__ = \
     ]
 
 
-_default_dtype = [np.float64]
+_default_dtype = np.float64
 
 
 def default_dtype():
-    return _default_dtype[0]
+    return _default_dtype
 
 
 def set_default_dtype(dtype):
-    _default_dtype[0] = dtype
+    global _default_dtype
+    if not issubclass(dtype, (np.floating, np.complexfloating)):
+        raise ValueError("Invalid dtype")
+    _default_dtype = dtype
 
 
 class FunctionSpaceInterface(SpaceInterface):
@@ -83,7 +81,7 @@ class FunctionSpaceInterface(SpaceInterface):
 
 class FunctionSpace:
     def __init__(self, dim, *, dtype=None):
-        comm = DEFAULT_COMM
+        comm = comm_dup_cached(DEFAULT_COMM)
         if comm.size > 1:
             raise RuntimeError("Serial only")
         if dtype is None:
@@ -144,6 +142,8 @@ class FunctionInterface(_FunctionInterface):
 
     def _assign(self, y):
         dtype = self.dtype()
+        if isinstance(y, SymbolicFloat):
+            y = y.value()
         if isinstance(y, (int, np.integer,
                           float, np.floating,
                           complex, np.complexfloating)) \
@@ -157,10 +157,11 @@ class FunctionInterface(_FunctionInterface):
         else:
             raise TypeError("Invalid type")
 
-    def _axpy(self, *args):  # self, alpha, x
-        alpha, x = args
+    def _axpy(self, alpha, x, /):
         dtype = self.dtype()
         alpha = dtype(alpha)
+        if isinstance(x, SymbolicFloat):
+            x = x.value()
         if isinstance(x, (int, np.integer,
                           float, np.floating,
                           complex, np.complexfloating)) \
@@ -177,9 +178,6 @@ class FunctionInterface(_FunctionInterface):
     def _inner(self, y):
         assert isinstance(y, Function)
         return y.vector().conjugate().dot(self.vector())
-
-    def _max_value(self):
-        return self.vector().max()
 
     def _sum(self):
         return self.vector().sum()
@@ -375,36 +373,6 @@ def new_scalar_function(*, name=None, comm=None, static=False, cache=None,
                         checkpoint=None):
     return Function(FunctionSpace(1), name=name, static=static, cache=cache,
                     checkpoint=checkpoint)
-
-
-class Functional(_Functional):
-    def __init__(self, *, space=None, name=None, _fn=None):
-        if space is None and _fn is None:
-            space = function_space(new_scalar_function())
-
-        super().__init__(space=space, name=name, _fn=_fn)
-
-
-class GaussNewton(_GaussNewton):
-    def __init__(self, forward, R_inv_action, B_inv_action=None,
-                 *, J_space=None, manager=None):
-        if J_space is None:
-            J_space = function_space(new_scalar_function())
-
-        super().__init__(
-            forward, J_space, R_inv_action, B_inv_action=B_inv_action,
-            manager=manager)
-
-
-class CachedGaussNewton(_CachedGaussNewton):
-    def __init__(self, X, R_inv_action, B_inv_action=None,
-                 *, J_space=None, manager=None):
-        if J_space is None:
-            J_space = function_space(new_scalar_function())
-
-        super().__init__(
-            X, J_space, R_inv_action, B_inv_action=B_inv_action,
-            manager=manager)
 
 
 def default_comm():

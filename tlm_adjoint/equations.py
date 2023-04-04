@@ -29,6 +29,7 @@ from .interface import check_space_types, check_space_types_conjugate_dual, \
     function_update_caches, function_update_state, function_zero, \
     is_function, no_space_type_checking, space_new, \
     subtract_adjoint_derivative_action
+from .manager import paused_manager, restore_manager, set_manager
 
 from .alias import WeakAlias, gc_disabled
 from .manager import manager as _manager
@@ -38,6 +39,7 @@ import copy
 import inspect
 import logging
 import numpy as np
+from operator import itemgetter
 import warnings
 import weakref
 
@@ -57,32 +59,39 @@ __all__ = \
 
         "get_tangent_linear",
 
-        "AssignmentSolver",
-        "AxpySolver",
+        "Assignment",
+        "Axpy",
         "FixedPointSolver",
-        "LinearCombinationSolver",
-        "NullSolver",
-        "ScaleSolver",
+        "LinearCombination",
+        "ZeroAssignment",
 
         "LinearEquation",
         "Matrix",
         "RHS",
 
         "DotProductRHS",
-        "DotProductSolver",
+        "DotProduct",
         "InnerProductRHS",
-        "InnerProductSolver",
+        "InnerProduct",
         "MatrixActionRHS",
-        "MatrixActionSolver",
-        "NormSqRHS",
-        "NormSqSolver",
-        "SumRHS",
-        "SumSolver",
 
         "Storage",
 
         "HDF5Storage",
-        "MemoryStorage"
+        "MemoryStorage",
+
+        "AssignmentSolver",
+        "AxpySolver",
+        "DotProductSolver",
+        "InnerProductSolver",
+        "LinearCombinationSolver",
+        "MatrixActionSolver",
+        "NormSqRHS",
+        "NormSqSolver",
+        "NullSolver",
+        "ScaleSolver",
+        "SumRHS",
+        "SumSolver"
     ]
 
 
@@ -172,7 +181,13 @@ class AdjointBlockRHS:
 
 class AdjointModelRHS:
     def __init__(self, blocks):
-        self._B = [AdjointBlockRHS(block) for block in blocks]
+        if isinstance(blocks, Sequence):
+            # Sequence
+            self._blocks_n = list(range(len(blocks)))
+        else:
+            # Mapping
+            self._blocks_n = sorted(blocks.keys())
+        self._B = {n: AdjointBlockRHS(blocks[n]) for n in self._blocks_n}
         self._pop_empty()
 
     def __getitem__(self, key):
@@ -186,14 +201,14 @@ class AdjointModelRHS:
             return self._B[p][k][m]
 
     def pop(self):
-        i, B = self._B[-1].pop()
-        n = len(self._B) - 1
+        n = self._blocks_n[-1]
+        i, B = self._B[n].pop()
         self._pop_empty()
         return (n, i), B
 
     def _pop_empty(self):
-        while len(self._B) > 0 and self._B[-1].is_empty():
-            self._B.pop()
+        while len(self._B) > 0 and self._B[self._blocks_n[-1]].is_empty():
+            del self._B[self._blocks_n.pop()]
 
     def is_empty(self):
         return len(self._B) == 0
@@ -241,7 +256,7 @@ class Referrer:
                         if child_id not in referrers and child_id not in remaining_referrers:  # noqa: E501
                             remaining_referrers[child_id] = child
         return tuple(e[1] for e in sorted(tuple(referrers.items()),
-                                          key=lambda e: e[0]))
+                                          key=itemgetter(0)))
 
     def _drop_references(self):
         if not self._references_dropped:
@@ -291,7 +306,8 @@ class Equation(Referrer):
 
         if is_function(X):
             X = (X,)
-        X_ids = {function_id(x) for x in X}
+        X_ids = set(map(function_id, X))
+        dep_ids = {function_id(dep): i for i, dep in enumerate(deps)}
         for x in X:
             if not is_function(x):
                 raise ValueError("Solution must be a function")
@@ -299,10 +315,9 @@ class Equation(Referrer):
                 raise ValueError("Solution must be checkpointed")
             if function_is_alias(x):
                 raise ValueError("Solution cannot be an alias")
-            if x not in deps:
+            if function_id(x) not in dep_ids:
                 raise ValueError("Solution must be a dependency")
 
-        dep_ids = {function_id(dep): i for i, dep in enumerate(deps)}
         if len(dep_ids) != len(deps):
             raise ValueError("Duplicate dependency")
         for dep in deps:
@@ -311,13 +326,12 @@ class Equation(Referrer):
 
         if nl_deps is None:
             nl_deps = tuple(deps)
-        nl_dep_ids = {function_id(dep) for dep in nl_deps}
+        nl_dep_ids = set(map(function_id, nl_deps))
         if len(nl_dep_ids) != len(nl_deps):
             raise ValueError("Duplicate non-linear dependency")
         for dep in nl_deps:
             if function_id(dep) not in dep_ids:
                 raise ValueError("Non-linear dependency is not a dependency")
-        nl_deps_map = tuple(dep_ids[function_id(dep)] for dep in nl_deps)
 
         if ic_deps is None:
             ic_deps = []
@@ -326,7 +340,7 @@ class Equation(Referrer):
         else:
             if ic is None:
                 ic = False
-        ic_dep_ids = {function_id(dep) for dep in ic_deps}
+        ic_dep_ids = set(map(function_id, ic_deps))
         if len(ic_dep_ids) != len(ic_deps):
             raise ValueError("Duplicate initial condition dependency")
         for dep in ic_deps:
@@ -343,7 +357,7 @@ class Equation(Referrer):
         else:
             if adj_ic is None:
                 adj_ic = False
-        adj_ic_dep_ids = {function_id(dep) for dep in adj_ic_deps}
+        adj_ic_dep_ids = set(map(function_id, adj_ic_deps))
         if len(adj_ic_dep_ids) != len(adj_ic_deps):
             raise ValueError("Duplicate adjoint initial condition dependency")
         for dep in adj_ic_deps:
@@ -368,7 +382,6 @@ class Equation(Referrer):
         self._X = tuple(X)
         self._deps = tuple(deps)
         self._nl_deps = tuple(nl_deps)
-        self._nl_deps_map = nl_deps_map
         self._ic_deps = tuple(ic_deps)
         self._adj_ic_deps = tuple(adj_ic_deps)
         self._adj_X_type = tuple(adj_type)
@@ -443,9 +456,6 @@ class Equation(Referrer):
     def nonlinear_dependencies(self):
         return self._nl_deps
 
-    def nonlinear_dependencies_map(self):
-        return self._nl_deps_map
-
     def initial_condition_dependencies(self):
         return self._ic_deps
 
@@ -478,38 +488,33 @@ class Equation(Referrer):
         for dep in self.initial_condition_dependencies():
             manager.add_initial_condition(dep, annotate=annotate)
 
-    def _post_process(self, manager=None, annotate=None, tlm=None,
-                      tlm_skip=None):
+    def _post_process(self, manager=None, annotate=None, tlm=None):
         if manager is None:
             manager = _manager()
-        manager.add_equation(self, annotate=annotate, tlm=tlm,
-                             tlm_skip=tlm_skip)
+        manager.add_equation(self, annotate=annotate, tlm=tlm)
 
-    def solve(self, manager=None, annotate=None, tlm=None, _tlm_skip=None):
+    @restore_manager
+    def solve(self, manager=None, annotate=None, tlm=None):
         """
         Solve the equation.
 
         Arguments:
 
         manager   (Optional) The equation manager.
-        annotate  (Optional) Whether the equation should be annotated.
+        annotate  (Optional) Whether the equation should be recorded.
         tlm       (Optional) Whether to derive (and solve) associated
                   tangent-linear equations.
         """
 
-        if manager is None:
-            manager = _manager()
+        if manager is not None:
+            set_manager(manager)
 
-        self._pre_process(manager=manager, annotate=annotate)
+        self._pre_process(annotate=annotate)
 
-        annotation_enabled, tlm_enabled = manager.stop()
-        try:
+        with paused_manager():
             self.forward(self.X())
-        finally:
-            manager.start(annotation=annotation_enabled, tlm=tlm_enabled)
 
-        self._post_process(manager=manager, annotate=annotate, tlm=tlm,
-                           tlm_skip=_tlm_skip)
+        self._post_process(annotate=annotate, tlm=tlm)
 
     def forward(self, X, deps=None):
         """
@@ -635,7 +640,8 @@ class Equation(Referrer):
                      dependencies.
         dep_index    The index of the dependency in self.dependencies() with
                      respect to which a derivative should be taken.
-        adj_x/adj_X  The direction of the adjoint derivative action.
+        adj_x/adj_X  A function or sequence of functions on which the adjoint
+                     of the derivative acts.
         """
 
         raise NotImplementedError("Method not overridden")
@@ -648,12 +654,13 @@ class Equation(Referrer):
         adjoint_derivative_action method.
 
         The form:
-            subtract_adjoint_derivative_actions(self, adj_x, nl_deps, Bs)
+            subtract_adjoint_derivative_actions(self, adj_x, nl_deps, dep_Bs)
         should be used for equations which solve for a single function.
 
         Arguments:
 
-        adj_x/adj_X  The direction of the adjoint derivative actions.
+        adj_x/adj_X  A function or sequence of functions on which the adjoint
+                     of the derivatives act.
         nl_deps      A sequence of functions defining the values of non-linear
                      dependencies.
         dep_Bs       Dictionary of dep_index: dep_B pairs, where each dep_B is
@@ -692,7 +699,7 @@ class Equation(Referrer):
     def tangent_linear(self, M, dM, tlm_map):
         """
         Return an Equation corresponding to a tangent linear equation,
-        computing derivatives with respect to the control M in the direction
+        computing derivatives with respect to the control M with direction
         dM.
 
         Arguments:
@@ -722,7 +729,6 @@ class ControlsMarker(Equation):
         self._X = tuple(M)
         self._deps = tuple(M)
         self._nl_deps = ()
-        self._nl_deps_map = ()
         self._ic_deps = ()
         self._adj_ic_deps = ()
         self._adj_X_type = tuple("conjugate_dual" for m in M)
@@ -741,7 +747,7 @@ class FunctionalMarker(Equation):
         J  A function. The functional.
         """
 
-        J = J.fn()
+        J = J.function()
         # Extra function allocation could be avoided
         J_ = function_new(J)
         super().__init__([J_], [J_, J], nl_deps=[], ic=False, adj_ic=False)
@@ -762,7 +768,7 @@ def get_tangent_linear(x, M, dM, tlm_map):
         return tlm_map[x]
 
 
-class NullSolver(Equation):
+class ZeroAssignment(Equation):
     def __init__(self, X):
         if is_function(X):
             X = (X,)
@@ -786,11 +792,19 @@ class NullSolver(Equation):
         return B
 
     def tangent_linear(self, M, dM, tlm_map):
-        return NullSolver([tlm_map[x] for x in self.X()])
+        return ZeroAssignment([tlm_map[x] for x in self.X()])
 
 
-class AssignmentSolver(Equation):
-    def __init__(self, y, x):
+class NullSolver(ZeroAssignment):
+    def __init__(self, X):
+        warnings.warn("NullSolver is deprecated -- "
+                      "use ZeroAssignment instead",
+                      DeprecationWarning, stacklevel=2)
+        super().__init__(X)
+
+
+class Assignment(Equation):
+    def __init__(self, x, y):
         check_space_types(x, y)
         super().__init__(x, [x, y], nl_deps=[], ic=False, adj_ic=False)
 
@@ -813,20 +827,34 @@ class AssignmentSolver(Equation):
         x, y = self.dependencies()
         tau_y = get_tangent_linear(y, M, dM, tlm_map)
         if tau_y is None:
-            return NullSolver(tlm_map[x])
+            return ZeroAssignment(tlm_map[x])
         else:
-            return AssignmentSolver(tau_y, tlm_map[x])
+            return Assignment(tlm_map[x], tau_y)
 
 
-class LinearCombinationSolver(Equation):
+class AssignmentSolver(Assignment):
+    def __init__(self, y, x):
+        warnings.warn("AssignmentSolver is deprecated -- "
+                      "use Assignment instead",
+                      DeprecationWarning, stacklevel=2)
+        super().__init__(x, y)
+
+
+class LinearCombination(Equation):
     def __init__(self, x, *args):
-        alpha = tuple(function_dtype(x)(arg[0]) for arg in args)
-        Y = [arg[1] for arg in args]
-        for y in Y:
+        alpha = []
+        Y = []
+        for a, y in args:
+            a = function_dtype(x)(a)
+            if a.imag == 0.0:
+                a = a.real
             check_space_types(x, y)
 
+            alpha.append(a)
+            Y.append(y)
+
         super().__init__(x, [x] + Y, nl_deps=[], ic=False, adj_ic=False)
-        self._alpha = alpha
+        self._alpha = tuple(alpha)
 
     def forward_solve(self, x, deps=None):
         deps = self.dependencies() if deps is None else tuple(deps)
@@ -855,18 +883,36 @@ class LinearCombinationSolver(Equation):
             tau_y = get_tangent_linear(y, M, dM, tlm_map)
             if tau_y is not None:
                 args.append((alpha, tau_y))
-        return LinearCombinationSolver(tlm_map[x], *args)
+        return LinearCombination(tlm_map[x], *args)
 
 
-class ScaleSolver(LinearCombinationSolver):
+class LinearCombinationSolver(LinearCombination):
+    def __init__(self, x, *args):
+        warnings.warn("LinearCombinationSolver is deprecated -- "
+                      "use LinearCombination instead",
+                      DeprecationWarning, stacklevel=2)
+        super().__init__(x, *args)
+
+
+class ScaleSolver(LinearCombination):
     def __init__(self, alpha, y, x):
+        warnings.warn("ScaleSolver is deprecated -- "
+                      "use LinearCombination instead",
+                      DeprecationWarning, stacklevel=2)
         super().__init__(x, (alpha, y))
 
 
-class AxpySolver(LinearCombinationSolver):
-    def __init__(self, *args):  # self, y_old, alpha, x, y_new
-        y_old, alpha, x, y_new = args
+class Axpy(LinearCombination):
+    def __init__(self, y_new, y_old, alpha, x):
         super().__init__(y_new, (1.0, y_old), (alpha, x))
+
+
+class AxpySolver(Axpy):
+    def __init__(self, y_old, alpha, x, y_new, /):
+        warnings.warn("AxpySolver is deprecated -- "
+                      "use Axpy instead",
+                      DeprecationWarning, stacklevel=2)
+        super().__init__(y_new, y_old, alpha, x)
 
 
 @no_space_type_checking
@@ -954,10 +1000,10 @@ class FixedPointSolver(Equation, CustomNormSq):
             Solver parameters dictionary. Parameters (based on KrylovSolver
             parameters in FEniCS 2017.2.0):
                 absolute_tolerance
-                    Absolute tolerance for the solution change 2-norm. Float,
+                    Absolute tolerance for the solution change. Float,
                     required.
                 relative_tolerance
-                    Relative tolerance for the solution change 2-norm. Float,
+                    Relative tolerance for the solution change. Float,
                     required.
                 maximum_iterations
                     Maximum permitted iterations. Positive integer, optional,
@@ -984,14 +1030,14 @@ class FixedPointSolver(Equation, CustomNormSq):
 
         solver_parameters = copy.deepcopy(solver_parameters)
         if "nonzero_adjoint_initial_guess" in solver_parameters:
-            warnings.warn("'nonzero_adjoint_initial_guess' parameter is "
-                          "deprecated -- use 'adjoint_nonzero_initial_guess' "
+            warnings.warn("nonzero_adjoint_initial_guess parameter is "
+                          "deprecated -- use adjoint_nonzero_initial_guess "
                           "instead",
                           DeprecationWarning, stacklevel=2)
             if "adjoint_nonzero_initial_guess" in solver_parameters:
                 raise ValueError("Cannot supply both "
-                                 "'nonzero_adjoint_initial_guess' and "
-                                 "'adjoint_nonzero_initial_guess' "
+                                 "nonzero_adjoint_initial_guess and "
+                                 "adjoint_nonzero_initial_guess "
                                  "parameters")
             solver_parameters["adjoint_nonzero_initial_guess"] = \
                 solver_parameters.pop("nonzero_adjoint_initial_guess")
@@ -1000,8 +1046,7 @@ class FixedPointSolver(Equation, CustomNormSq):
                                    ("nonzero_initial_guess", True),
                                    ("adjoint_nonzero_initial_guess", True),
                                    ("adjoint_eqs_index_0", 0)]:
-            if key not in solver_parameters:
-                solver_parameters[key] = default_value
+            solver_parameters.setdefault(key, default_value)
 
         nonzero_initial_guess = solver_parameters["nonzero_initial_guess"]
         adjoint_nonzero_initial_guess = \
@@ -1175,7 +1220,6 @@ class FixedPointSolver(Equation, CustomNormSq):
         if not nonzero_initial_guess:
             for x in X:
                 function_zero(x)
-            function_update_state(*X)
             function_update_caches(*self.X(), value=X)
 
         it = 0
@@ -1379,7 +1423,7 @@ class FixedPointSolver(Equation, CustomNormSq):
         for eq in self._eqs:
             tlm_eq = eq.tangent_linear(M, dM, tlm_map)
             if tlm_eq is None:
-                tlm_eq = NullSolver([tlm_map[x] for x in eq.X()])
+                tlm_eq = ZeroAssignment([tlm_map[x] for x in eq.X()])
             tlm_eqs.append(tlm_eq)
         return FixedPointSolver(
             tlm_eqs, solver_parameters=self._solver_parameters,
@@ -1387,11 +1431,21 @@ class FixedPointSolver(Equation, CustomNormSq):
 
 
 class LinearEquation(Equation):
-    def __init__(self, B, X, *, A=None, adj_type=None):
-        if isinstance(B, RHS):
-            B = (B,)
+    def __init__(self, X, B, *, A=None, adj_type=None):
+        if isinstance(X, RHS) \
+                or (isinstance(X, Sequence) and len(X) > 0
+                    and isinstance(X[0], RHS)):
+            warnings.warn("LinearEquation(B, X, *, A=None, adj_type=None) "
+                          "signature is deprecated -- use "
+                          "LinearEquation(X, B, *, A=None, adj_type=None) "
+                          "instead",
+                          DeprecationWarning, stacklevel=2)
+            X, B = B, X
+
         if is_function(X):
             X = (X,)
+        if isinstance(B, RHS):
+            B = (B,)
         if adj_type is None:
             if A is None:
                 adj_type = "conjugate_dual"
@@ -1610,9 +1664,9 @@ class LinearEquation(Equation):
                 tlm_B.extend(tlm_b)
 
         if len(tlm_B) == 0:
-            return NullSolver([tlm_map[x] for x in self.X()])
+            return ZeroAssignment([tlm_map[x] for x in self.X()])
         else:
-            return LinearEquation(tlm_B, [tlm_map[x] for x in self.X()],
+            return LinearEquation([tlm_map[x] for x in self.X()], tlm_B,
                                   A=self._A, adj_type=self.adj_X_type())
 
 
@@ -1624,12 +1678,11 @@ class Matrix(Referrer):
             raise ValueError("Duplicate non-linear dependency")
 
         if has_ic_dep is not None:
-            warnings.warn("'has_ic_dep' argument is deprecated -- use 'ic' "
+            warnings.warn("has_ic_dep argument is deprecated -- use ic "
                           "instead",
                           DeprecationWarning, stacklevel=2)
             if ic is not None:
-                raise TypeError("Cannot pass both 'has_ic_dep' and 'ic' "
-                                "arguments")
+                raise TypeError("Cannot pass both has_ic_dep and ic arguments")
             ic = has_ic_dep
         elif ic is None:
             ic = True
@@ -1763,7 +1816,8 @@ class Matrix(Referrer):
                      self.nonlinear_dependencies() with respect to which a
                      derivative should be taken.
         x/X          The argument of the forward matrix action.
-        adj_x/adj_X  The direction of the adjoint derivative action.
+        adj_x/adj_X  A function or sequence of functions on which the adjoint
+                     of the derivative acts.
         b            The result.
         method       (Optional) One of {"assign", "add", "sub"}.
         """
@@ -1779,13 +1833,13 @@ class Matrix(Referrer):
 
 class RHS(Referrer):
     def __init__(self, deps, nl_deps=None):
-        dep_ids = {function_id(dep) for dep in deps}
+        dep_ids = set(map(function_id, deps))
         if len(dep_ids) != len(deps):
             raise ValueError("Duplicate dependency")
 
         if nl_deps is None:
             nl_deps = tuple(deps)
-        nl_dep_ids = {function_id(dep) for dep in nl_deps}
+        nl_dep_ids = set(map(function_id, nl_deps))
         if len(nl_dep_ids) != len(nl_deps):
             raise ValueError("Duplicate non-linear dependency")
         if len(dep_ids.intersection(nl_dep_ids)) != len(nl_deps):
@@ -1818,22 +1872,42 @@ class RHS(Referrer):
 
 class MatrixActionSolver(LinearEquation):
     def __init__(self, Y, A, X):
-        super().__init__(MatrixActionRHS(A, Y), X)
+        warnings.warn("MatrixActionSolver is deprecated",
+                      DeprecationWarning, stacklevel=2)
+        super().__init__(X, MatrixActionRHS(A, Y))
 
 
-class DotProductSolver(LinearEquation):
+class DotProduct(LinearEquation):
+    def __init__(self, x, y, z, *, alpha=1.0):
+        super().__init__(x, DotProductRHS(y, z, alpha=alpha))
+
+
+class DotProductSolver(DotProduct):
     def __init__(self, y, z, x, alpha=1.0):
-        super().__init__(DotProductRHS(y, z, alpha=alpha), x)
+        warnings.warn("DotProductSolver is deprecated -- "
+                      "use DotProduct instead",
+                      DeprecationWarning, stacklevel=2)
+        super().__init__(x, y, z, alpha=alpha)
 
 
-class InnerProductSolver(LinearEquation):
+class InnerProduct(LinearEquation):
+    def __init__(self, x, y, z, *, alpha=1.0, M=None):
+        super().__init__(x, InnerProductRHS(y, z, alpha=alpha, M=M))
+
+
+class InnerProductSolver(InnerProduct):
     def __init__(self, y, z, x, alpha=1.0, M=None):
-        super().__init__(InnerProductRHS(y, z, alpha=alpha, M=M), x)
+        warnings.warn("InnerProductSolver is deprecated -- "
+                      "use InnerProduct instead",
+                      DeprecationWarning, stacklevel=2)
+        super().__init__(x, y, z, alpha=alpha, M=M)
 
 
-class NormSqSolver(InnerProductSolver):
+class NormSqSolver(InnerProduct):
     def __init__(self, y, x, alpha=1.0, M=None):
-        super().__init__(y, y, x, alpha=alpha, M=M)
+        warnings.warn("NormSqSolver is deprecated",
+                      DeprecationWarning, stacklevel=2)
+        super().__init__(x, y, y, alpha=alpha, M=M)
 
 
 class SumSolver(LinearEquation):
@@ -1841,7 +1915,7 @@ class SumSolver(LinearEquation):
         warnings.warn("SumSolver is deprecated",
                       DeprecationWarning, stacklevel=2)
 
-        super().__init__(SumRHS(y), x)
+        super().__init__(x, SumRHS(y))
 
 
 class MatrixActionRHS(RHS):
@@ -1938,7 +2012,7 @@ class DotProductRHS(RHS):
 
         check_space_types_dual(x, y)
 
-        x_equals_y = x == y
+        x_equals_y = function_id(x) == function_id(y)
         if x_equals_y:
             deps = [x]
         else:
@@ -2049,7 +2123,7 @@ class InnerProductRHS(RHS):
             raise NotImplementedError("Non-linear matrix dependencies not "
                                       "supported")
 
-        norm_sq = x == y
+        norm_sq = function_id(x) == function_id(y)
         if norm_sq:
             deps = [x]
         else:
@@ -2178,6 +2252,8 @@ class InnerProductRHS(RHS):
 
 class NormSqRHS(InnerProductRHS):
     def __init__(self, x, alpha=1.0, M=None):
+        warnings.warn("NormSqRHS is deprecated",
+                      DeprecationWarning, stacklevel=2)
         super().__init__(x, x, alpha=alpha, M=M)
 
 
@@ -2242,7 +2318,7 @@ class Storage(Equation):
             raise IndexError("dep_index out of bounds")
 
     def tangent_linear(self, M, dM, tlm_map):
-        return NullSolver(tlm_map[self.x()])
+        return ZeroAssignment(tlm_map[self.x()])
 
 
 class MemoryStorage(Storage):

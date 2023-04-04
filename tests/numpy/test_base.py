@@ -20,6 +20,7 @@
 
 from tlm_adjoint.numpy import *
 from tlm_adjoint.numpy import manager as _manager
+from tlm_adjoint.alias import gc_disabled
 
 import copy
 import functools
@@ -28,6 +29,13 @@ import hashlib
 import inspect
 import logging
 import numpy as np
+try:
+    from operator import call
+except ImportError:
+    # For Python < 3.11, following Python 3.11 API
+    def call(obj, /, *args, **kwargs):
+        return obj(*args, **kwargs)
+from operator import itemgetter
 import os
 import pytest
 import runpy
@@ -49,17 +57,18 @@ __all__ = \
 
 @pytest.fixture
 def setup_test():
-    reset_manager("memory", {"drop_references": True})
-    clear_caches()
-    stop_manager()
+    set_default_dtype(np.float64)
 
     logging.getLogger("tlm_adjoint").setLevel(logging.DEBUG)
 
-    set_default_dtype(np.float64)
+    reset_manager("memory", {"drop_references": True})
+    stop_manager()
+    clear_caches()
 
     yield
 
     reset_manager("memory", {"drop_references": False})
+    clear_caches()
 
 
 def seed_test(fn):
@@ -73,7 +82,7 @@ def seed_test(fn):
         h = hashlib.sha256()
         h.update(fn.__name__.encode("utf-8"))
         h.update(str(args).encode("utf-8"))
-        h.update(str(sorted(h_kwargs.items(), key=lambda e: e[0])).encode("utf-8"))  # noqa: E501
+        h.update(str(sorted(h_kwargs.items(), key=itemgetter(0))).encode("utf-8"))  # noqa: E501
         seed = int(h.hexdigest(), 16)
         seed %= 2 ** 32
         np.random.seed(seed)
@@ -88,66 +97,55 @@ def test_default_dtypes(request):
     set_default_dtype(request.param["default_dtype"])
 
 
-function_ids = {}
+_function_ids = weakref.WeakValueDictionary()
+
+
+def clear_function_references():
+    _function_ids.clear()
+
+
+@gc_disabled
+def referenced_functions():
+    return tuple(F_ref for F_ref in map(call, _function_ids.valuerefs())
+                 if F_ref is not None)
 
 
 def _Function__init__(self, *args, **kwargs):
     _Function__init__orig(self, *args, **kwargs)
-    function_ids[function_id(self)] = weakref.ref(self)
+    _function_ids[function_id(self)] = self
 
 
 _Function__init__orig = Function.__init__
 Function.__init__ = _Function__init__
 
 
-def _EquationManager_configure_checkpointing(self, *args, **kwargs):
-    if hasattr(self, "_cp_manager") \
-            and hasattr(self, "_cp_path"):
-        if self._cp_manager.is_exhausted() \
-                and self._cp_manager.max_n() is not None \
-                and self._cp_manager.r() == self._cp_manager.max_n() \
-                and self._cp_path is not None:
-            self._comm.barrier()
-            if os.path.exists(self._cp_path):
-                assert len(os.listdir(self._cp_path)) == 0
-
-    _EquationManager_configure_checkpointing__orig(self, *args, **kwargs)
-
-
-_EquationManager_configure_checkpointing__orig = EquationManager.configure_checkpointing  # noqa: E501
-EquationManager.configure_checkpointing = _EquationManager_configure_checkpointing  # noqa: E501
-
-
 @pytest.fixture
 def test_leaks():
-    function_ids.clear()
+    clear_function_references()
 
     yield
 
     gc.collect()
 
     # Clear some internal storage that is allowed to keep references
+    clear_caches()
     manager = _manager()
     manager.drop_references()
     manager._cp.clear(clear_refs=True)
     manager._cp_memory.clear()
-    tlm_values = list(manager._tlm.values())  # noqa: F841
     manager._tlm.clear()
-    tlm_eqs_values = [list(eq_tlm_eqs.values()) for eq_tlm_eqs in manager._tlm_eqs.values()]  # noqa: E501,F841
-    manager._tlm_eqs.clear()
+    manager._adj_cache.clear()
 
     gc.collect()
 
     refs = 0
-    for F in function_ids.values():
-        F = F()
-        if F is not None:
-            info(f"{function_name(F):s} referenced")
-            refs += 1
+    for F in referenced_functions():
+        info(f"{function_name(F):s} referenced")
+        refs += 1
     if refs == 0:
         info("No references")
 
-    function_ids.clear()
+    clear_function_references()
     assert refs == 0
 
     manager.reset("memory", {"drop_references": False})

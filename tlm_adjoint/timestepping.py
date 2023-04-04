@@ -21,9 +21,11 @@
 from .interface import function_id, is_function, space_new, time_system_eq
 
 from .alias import Alias
-from .equations import AssignmentSolver, Equation
+from .equations import Assignment, Equation
 
 from collections import OrderedDict
+from operator import itemgetter
+import warnings
 
 __all__ = \
     [
@@ -137,7 +139,7 @@ class TimeLevels:
     def __init__(self, levels, cycle_map):
         levels = tuple(sorted(set(levels)))
         # Always assign to earlier time levels first in the cycle
-        cycle_map = OrderedDict(sorted(cycle_map.items(), key=lambda i: i[0]))
+        cycle_map = OrderedDict(sorted(cycle_map.items(), key=itemgetter(0)))
 
         self._levels = levels
         self._cycle_map = cycle_map
@@ -189,8 +191,8 @@ class TimeFunction:
 
     def cycle(self, *, manager=None):
         if self._cycle_eqs is None:
-            self._cycle_eqs = tuple(AssignmentSolver(self[source_level],
-                                                     self[target_level])
+            self._cycle_eqs = tuple(Assignment(self[target_level],
+                                               self[source_level])
                                     for target_level, source_level
                                     in self._levels._cycle_map.items())
         for eq in self._cycle_eqs:
@@ -207,6 +209,8 @@ class TimeSystem:
         self._tfns = None
 
     def add_assignment(self, y, x):
+        warnings.warn("TimeSystem.add_assignment method is deprecated",
+                      DeprecationWarning, stacklevel=2)
         self.add_solve(y, x)
 
     def add_solve(self, *args, **kwargs):
@@ -219,7 +223,9 @@ class TimeSystem:
               and is_function(args[0])
               and is_function(args[1])
               and hasattr(args[1], "_tlm_adjoint__tfn")):
-            eq = AssignmentSolver(args[0], args[1])
+            warnings.warn("TimeSystem.add_solve(y, x) signature is deprecated",
+                          DeprecationWarning, stacklevel=2)
+            eq = Assignment(args[1], args[0])
         else:
             eq = time_system_eq(*args, **kwargs)
 
