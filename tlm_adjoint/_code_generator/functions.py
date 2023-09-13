@@ -423,11 +423,11 @@ class DirichletBC(backend_DirichletBC):
             static = True
             for dep in ufl.algorithms.extract_coefficients(
                     g if isinstance(g, ufl.classes.Expr)
-                    else backend_Constant(g)):
+                    else Constant(g, static=True)):
                 # The 'static' flag for functions is only a hint. 'not
                 # checkpointed' is a guarantee that the function will never
                 # appear as the solution to an Equation.
-                if not is_function(dep) or not function_is_checkpointed(dep):
+                if not is_function(dep) or function_is_checkpointed(dep):
                     static = False
                     break
         if cache is None:
